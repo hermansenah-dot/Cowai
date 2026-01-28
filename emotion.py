@@ -12,6 +12,7 @@ class MoodState:
 
 class EmotionEngine:
     """
+    Simple discrete mood engine.
 
     mood range: [-3..3]
       -3 = very angry/annoyed
@@ -51,4 +52,34 @@ class EmotionEngine:
     def decay(self, step: int = 1) -> None:
         """
         Drift slowly toward neutral.
-        Drift slowly toward neutral.
+        step=1 is typical (one level per message cycle).
+        """
+        step = max(1, int(step))
+
+        if self.mood > 0:
+            self.mood = max(0, self.mood - step)
+        elif self.mood < 0:
+            self.mood = min(0, self.mood + step)
+
+    def label(self) -> str:
+        """Short label for logging / debugging."""
+        return self._moods.get(self.mood, MoodState("unknown", "")).label
+
+    def description(self) -> str:
+        """
+        Prompt-safe description for system injection.
+        Keep this as instructions, not roleplay text.
+        """
+        state = self._moods.get(self.mood)
+        if not state:
+            return "Neutral."
+        return f"Mood: {state.label}. Guidance: {state.instruction}"
+
+    def to_int(self) -> int:
+        """Current mood value as an integer."""
+        return self.mood
+
+
+# Global singleton (simple projects).
+# For per-user emotion later: create EmotionEngine per user_id instead of using this.
+emotion = EmotionEngine()
