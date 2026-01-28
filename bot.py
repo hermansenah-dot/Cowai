@@ -12,12 +12,8 @@ from emotion import emotion
 from personality.memory_short import get_short_memory
 from personality.memory_long import LongTermMemory
 from reminders import ReminderStore, reminder_loop, Reminder
-from config import DISCORD_TOKEN
+from config import DISCORD_TOKEN, ALLOWED_CHANNEL_IDS
 
-ALLOWED_CHANNEL_IDS = {
-    800899430927826975,  # ai-chat
-    1466093268755415328,  # testing
-}
 
 def looks_english(text: str) -> bool:
     """
