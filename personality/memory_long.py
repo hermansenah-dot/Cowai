@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any, Dict, List
+
+
+# Store per-user memory files here:
+# project_root/memory/users/<user_id>.json
+BASE_DIR = Path("memory") / "users"
+
+
+class Long_Term_Memory:
+    """
+    Per-user long-term memory persisted to a JSON file.
+
+    Keeps simple, stable facts:
+    - name
+    - preferred_language
+    - likes / dislikes
+    """
+
+    def __init__(self, user_id: int):
+        self.user_id = str(user_id)
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.file_path = BASE_DIR / f"{self.user_id}.json"
+
+        # Default schema
+        self.data: Dict[str, Any] = {
+            "name": None,
+            "preferred_language": "English",
+            "likes": [],
+            "dislikes": [],
+        }
+
+        self.load()
+
+    # ------------------
+    # Persistence
+    # ------------------
+
+    def load(self) -> None:
+        if self.file_path.exists():
+            try:
+                self.data = json.loads(self.file_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                print(f"[Memory] Failed to load {self.user_id}: {e}")
+
+    def save(self) -> None:
+        try:
+            self.file_path.write_text(
+                json.dumps(self.data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            print(f"[Memory] Failed to save {self.user_id}: {e}")
+
+    # ------------------
+    # Extraction logic
+    # ------------------
+
+    def update_from_text(self, text: str) -> None:
+        changed = False
+
+        changed |= self._extract_name(text)
+        changed |= self._extract_language(text)
+        changed |= self._extract_likes(text)
+        changed |= self._extract_dislikes(text)
+
+        if changed:
+            self.save()
+
+    def _extract_name(self, text: str) -> bool:
+        patterns = [
+            r"\bmy name is ([A-Za-z'-]+)\b",
+            r"\bi am ([A-Za-z'-]+)\b",
+            r"\bi'm ([A-Za-z'-]+)\b",
+            r"\bcall me ([A-Za-z'-]+)\b",
+        ]
+
+        for p in patterns:
+            m = re.search(p, text, re.IGNORECASE)
+            if m:
+                name = m.group(1)
+                if self.data.get("name") != name:
+                    self.data["name"] = name
+                    return True
+        return False
+
+    def _extract_language(self, text: str) -> bool:
+        t = text.lower()
+
+        # Keep it simple (you can expand later)
+        if "english" in t:
+            return self._set("preferred_language", "English")
+        if "danish" in t:
+            return self._set("preferred_language", "Danish")
+
+        return False
+
+    def _extract_likes(self, text: str) -> bool:
+        t = text.lower()
+        if "i like" not in t:
+            return False
+
+        value = text.split("i like", 1)[1].strip(" .!").lower()
+        if value and value not in self.data["likes"]:
+            self.data["likes"].append(value)
+            return True
+        return False
+
+    def _extract_dislikes(self, text: str) -> bool:
+        t = text.lower()
+
+        if "i dislike" in t:
+            value = text.split("i dislike", 1)[1]
+        elif "i hate" in t:
+            value = text.split("i hate", 1)[1]
+        else:
+            return False
+
+        value = value.strip(" .!").lower()
+        if value and value not in self.data["dislikes"]:
+            self.data["dislikes"].append(value)
+            return True
+        return False
+
+    def _set(self, key: str, value: Any) -> bool:
+        if self.data.get(key) != value:
+            self.data[key] = value
+            return True
+        return False
+
+    # ------------------
+    # Prompt injection
+    # ------------------
+
+    def as_prompt(self) -> str:
+        parts: List[str] = []
+
+        if self.data.get("name"):
+            parts.append(f"The user's name is {self.data['name']}.")
+
+        parts.append(f"Preferred language: {self.data.get('preferred_language', 'English')}.")
+
+        likes = self.data.get("likes") or []
+        dislikes = self.data.get("dislikes") or []
+
+        if likes:
+            parts.append("The user likes: " + ", ".join(likes) + ".")
+        if dislikes:
+            parts.append("The user dislikes: " + ", ".join(dislikes) + ".")
+
+        return " ".join(parts)
