@@ -1,5 +1,4 @@
 # List of banned words for the bot's filter.
 # Add one word per line, all lowercase.
-fuck
-holocaust
+coffee
 coffee

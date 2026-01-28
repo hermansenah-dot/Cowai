@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import re
+from __future__ import annotations
+
+import re
 
 
 def analyze_input(text: str) -> int:
