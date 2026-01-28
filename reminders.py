@@ -1,4 +1,3 @@
-
 import asyncio
 import json
 import os
@@ -51,5 +50,5 @@ async def reminder_loop(bot, store: ReminderStore, poll_seconds: float = 1.0):
         for r in due:
             channel = bot.get_channel(r.channel_id)
             if channel:
-                await channel.send(f"<@{r.user_id}> \u23f0 Reminder: {r.text}")
+                await channel.send(f"<@{r.user_id}> ⏰ Reminder: {r.text}")
         await asyncio.sleep(poll_seconds)
