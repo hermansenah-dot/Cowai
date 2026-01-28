@@ -1,0 +1,10 @@
+# Ignore Python cache and environment files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+venv/
+
+# Ignore config.py to prevent committing secrets
+config.py
