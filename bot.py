@@ -13,6 +13,7 @@ from personality.memory_short import get_short_memory
 from personality.memory_long import Long_Term_Memory
 from reminders import ReminderStore, reminder_loop, Reminder
 from config import DISCORD_TOKEN, ALLOWED_CHANNEL_IDS
+from tts_coqui import handle_tts_command,  warmup_tts
 
 
 def looks_english(text: str) -> bool:
@@ -32,7 +33,10 @@ def looks_english(text: str) -> bool:
 
     # Common English words check
     english_hits = sum(
-        1 for w in ["the", "and", "you", "is", "to", "of", "that", "it"]
+        1 for w in ["the", "be", "to", "of", "and",
+    "a", "in", "that", "have", "i",
+    "it", "for", "not", "on", "with",
+    "he", "as", "you", "do", "at",]
         if re.search(rf"\b{w}\b", text.lower())
     )
 
@@ -254,6 +258,17 @@ async def on_ready():
     # Start background reminder scheduler
     client.loop.create_task(reminder_loop(client, store))
 
+    print(f"Logged in as {client.user} (ID: {client.user.id})")
+
+    # Start reminders loop (your existing stuff)
+    client.loop.create_task(reminder_loop(client, store))
+
+    # Pre-warm Coqui TTS so first !tts is instant
+    client.loop.create_task(warmup_tts())
+
+    print("[TTS] Warmup complete.")
+
+
 
 @client.event
 async def on_message(message):
@@ -270,6 +285,16 @@ async def on_message(message):
         return
 
     content = message.content.strip()
+
+    if content.lower().startswith("!tts"):
+        pass
+        text = content[4:].strip()
+        if not text:
+            await message.channel.send("Usage: `!tts your text here`")
+            return
+
+    await handle_tts_command(message, text)
+    return
 
     # 👇 channel restriction
     if message.channel.id not in ALLOWED_CHANNEL_IDS:
