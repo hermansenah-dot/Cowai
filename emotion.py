@@ -99,6 +99,16 @@ class EmotionEngine:
         """Current mood value."""
         return self._value
 
+    # Compatibility helpers (older bot code)
+    def to_int(self) -> int:
+        """Alias for value() for backwards compatibility."""
+        return self.value()
+
+    @property
+    def mood(self) -> int:
+        """Alias property for the current mood integer."""
+        return self._value
+
     def label(self) -> str:
         """Short label for logs/debugging."""
         return self._moods.get(self._value, MoodState("unknown", "")).label

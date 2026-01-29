@@ -36,8 +36,8 @@ COQUI_MODEL = "tts_models/en/vctk/vits"
 SPEAKER_ID = "p225"
 
 # Audio energy tuning (safe values)
-ATEMPO = 0.90          # speed (1.05–1.15 recommended)
-PITCH_MULT = 0.97      # pitch (do NOT exceed ~1.05)
+ATEMPO = 0.80          # speed (1.05–1.15 recommended)
+PITCH_MULT = 0.96      # pitch (do NOT exceed ~1.05)
 
 # GPU toggle (set True if PyTorch CUDA works)
 USE_GPU = False
@@ -69,7 +69,7 @@ def energize_text(text: str) -> str:
     text = text.replace("?", "??")
 
     # Avoid overdoing periods
-    if len(text) < 120:
+    if len(text) < 150:
         text = text.replace(".", "!")
 
     return text
@@ -126,7 +126,7 @@ async def handle_tts_command(message: discord.Message, text: str) -> None:
             str(wav_path),
             options=(
                 f'-filter:a "'
-                f'asetrate=30000*{PITCH_MULT},'
+                f'asetrate=29000*{PITCH_MULT},'
                 f'atempo={1 / PITCH_MULT},'
                 f'atempo={ATEMPO},'
                 f'aresample=36000"'
@@ -154,5 +154,82 @@ async def handle_tts_command(message: discord.Message, text: str) -> None:
         try:
             if wav_path.exists():
                 wav_path.unlink()
+        except Exception:
+            pass
+
+
+async def handle_tts_lines(message: discord.Message, lines: list[str]) -> None:
+    """Join voice once, speak multiple lines back-to-back, then disconnect."""
+    lines = [str(x).strip() for x in (lines or []) if str(x).strip()]
+    if not lines:
+        return
+
+    if not message.author.voice or not message.author.voice.channel:
+        await message.channel.send("You need to be in a voice channel first.")
+        return
+
+    voice_channel = message.author.voice.channel
+    guild = message.guild
+    if guild is None:
+        return
+
+    vc = None
+    try:
+        # Connect (or move) once
+        vc = guild.voice_client
+        if vc and vc.is_connected():
+            if vc.channel.id != voice_channel.id:
+                await vc.move_to(voice_channel)
+        else:
+            vc = await voice_channel.connect()
+
+        tts_engine = get_tts_engine()
+
+        for raw in lines:
+            wav_path = TEMP_DIR / f"{uuid.uuid4().hex}.wav"
+            try:
+                spoken_text = energize_text(raw)
+                tts_engine.tts_to_file(
+                    text=spoken_text,
+                    speaker=SPEAKER_ID,
+                    file_path=str(wav_path),
+                )
+
+                audio = discord.FFmpegPCMAudio(
+                    str(wav_path),
+                    options=(
+                        f'-filter:a "'
+                        f'asetrate=30000*{PITCH_MULT},'
+                        f'atempo={1 / PITCH_MULT},'
+                        f'atempo={ATEMPO},'
+                        f'aresample=36000"'
+                    ),
+                )
+
+                done = asyncio.Event()
+
+                def _after(err):
+                    done.set()
+
+                vc.play(audio, after=_after)
+                await done.wait()
+
+            finally:
+                try:
+                    if wav_path.exists():
+                        wav_path.unlink()
+                except Exception:
+                    pass
+
+        try:
+            await vc.disconnect()
+        except Exception:
+            pass
+
+    except Exception as e:
+        await message.channel.send(f"TTS error: `{e}`")
+        try:
+            if guild.voice_client:
+                await guild.voice_client.disconnect()
         except Exception:
             pass
