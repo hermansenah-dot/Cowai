@@ -1,25 +1,20 @@
+"""tts_coqui.py
+
+Local Coqui TTS plugin for Discord (ENERGETIC PRESET).
+
+Changes vs baseline:
+- Uses speaker p225 (soft teen)
+- Adds energetic delivery:
+  * Slightly faster tempo
+  * Tiny pitch lift
+  * Text energizer for punchier prosody
+- Optional GPU support
+- Warmup to avoid first-run lag
 """
-tts_coqui.py
-
-Local Coqui TTS plugin for Discord.
-
-Features:
-- Triggered with !tts <text> (wired from bot.py)
-- Bot joins user's voice channel
-- Synthesizes speech locally with Coqui TTS
-- Plays it via FFmpeg
-- Disconnects
-
-Notes:
-- First run downloads the model (can take a bit)
-- Uses WAV output (simple and reliable)
-"""
-
 
 from __future__ import annotations
 
 import asyncio
-import os
 import uuid
 from pathlib import Path
 
@@ -34,9 +29,19 @@ from TTS.api import TTS
 TEMP_DIR = Path("tts_tmp")
 TEMP_DIR.mkdir(exist_ok=True)
 
-# Pick a model (good default English single-speaker)
-# You can change this later.
+# Multi-speaker English model
 COQUI_MODEL = "tts_models/en/vctk/vits"
+
+# Speaker choice (requested)
+SPEAKER_ID = "p225"
+
+# Audio energy tuning (safe values)
+ATEMPO = 0.90          # speed (1.05–1.15 recommended)
+PITCH_MULT = 0.97      # pitch (do NOT exceed ~1.05)
+
+# GPU toggle (set True if PyTorch CUDA works)
+USE_GPU = False
+
 
 # Lazily-initialized global TTS engine
 _tts_engine: TTS | None = None
@@ -45,24 +50,40 @@ _tts_engine: TTS | None = None
 def get_tts_engine() -> TTS:
     global _tts_engine
     if _tts_engine is None:
-        # gpu=True if you have CUDA and want speed (optional)
-        _tts_engine = TTS(model_name=COQUI_MODEL, progress_bar=False, gpu=False)
+        _tts_engine = TTS(
+            model_name=COQUI_MODEL,
+            progress_bar=False,
+            gpu=USE_GPU,
+        )
     return _tts_engine
 
+
+def energize_text(text: str) -> str:
+    """Light text normalization to encourage energetic prosody."""
+    text = text.strip()
+    if not text:
+        return text
+
+    # Encourage punchy delivery
+    text = text.replace("...", "!")
+    text = text.replace("?", "??")
+
+    # Avoid overdoing periods
+    if len(text) < 120:
+        text = text.replace(".", "!")
+
+    return text
+
+
 async def warmup_tts() -> None:
-    """
-    Load the Coqui model and run a tiny synthesis once.
-    Do this at bot startup so first !tts is fast.
-    """
+    """Warm the model at startup so first !tts is fast."""
     loop = asyncio.get_running_loop()
 
     def _warm():
         tts = get_tts_engine()
-        # Tiny synthesis to trigger model init
-        tts.tts("hi", speaker="p225")
+        tts.tts("hi", speaker=SPEAKER_ID)
 
     await loop.run_in_executor(None, _warm)
-
 
 
 # =========================
@@ -70,7 +91,8 @@ async def warmup_tts() -> None:
 # =========================
 
 async def handle_tts_command(message: discord.Message, text: str) -> None:
-    """Join voice, synthesize a WAV, play it, disconnect."""
+    """Join voice, synthesize WAV, play it energetically, disconnect."""
+
     if not message.author.voice or not message.author.voice.channel:
         await message.channel.send("You need to be in a voice channel first.")
         return
@@ -78,16 +100,17 @@ async def handle_tts_command(message: discord.Message, text: str) -> None:
     voice_channel = message.author.voice.channel
     guild = message.guild
 
-    # Output file
     wav_path = TEMP_DIR / f"{uuid.uuid4().hex}.wav"
 
     try:
-        # 1) Generate WAV with Coqui TTS (runs locally)
+        # 1) Generate WAV with Coqui TTS
         tts = get_tts_engine()
+        spoken_text = energize_text(text)
+
         tts.tts_to_file(
-            text=text,
-            speaker="p225",   # 👈 anime-ish / youthful speaker
-            file_path=str(wav_path)
+            text=spoken_text,
+            speaker=SPEAKER_ID,
+            file_path=str(wav_path),
         )
 
         # 2) Connect or move bot
@@ -98,11 +121,18 @@ async def handle_tts_command(message: discord.Message, text: str) -> None:
         else:
             vc = await voice_channel.connect()
 
-        # 3) Play via FFmpeg
+        # 3) Play via FFmpeg (energy filter)
         audio = discord.FFmpegPCMAudio(
             str(wav_path),
-            options="-filter:a atempo=1.08"
+            options=(
+                f'-filter:a "'
+                f'asetrate=30000*{PITCH_MULT},'
+                f'atempo={1 / PITCH_MULT},'
+                f'atempo={ATEMPO},'
+                f'aresample=36000"'
+            ),
         )
+
         done = asyncio.Event()
 
         def _after(err):
@@ -110,7 +140,6 @@ async def handle_tts_command(message: discord.Message, text: str) -> None:
 
         vc.play(audio, after=_after)
         await done.wait()
-
         await vc.disconnect()
 
     except Exception as e:

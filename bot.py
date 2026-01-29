@@ -7,6 +7,7 @@ Features:
 - Optional English-only filter (looks_english)
 - Reminders (relative + absolute + LLM extraction fallback)
 - Coqui TTS command: !tts <text> (joins VC, speaks, leaves)
+- Voice toggle: !voice on/off (auto TTS for AI replies when enabled)
 - LLM chat with short/long memory + emotion drift
 
 Notes:
@@ -43,6 +44,52 @@ from tts_coqui import handle_tts_command, warmup_tts
 
 
 # =========================
+# Voice toggle state
+# =========================
+# Cache per-user setting in memory. Persisted to LongMemory as "voice_enabled".
+VOICE_ENABLED: dict[int, bool] = {}
+
+
+def get_voice_enabled(user_id: int) -> bool:
+    """Get voice-enabled setting for a user (cached, persisted in LongMemory)."""
+    if user_id in VOICE_ENABLED:
+        return VOICE_ENABLED[user_id]
+
+    try:
+        lm = LongMemory(user_id)
+        enabled = bool(getattr(lm, "data", {}).get("voice_enabled", False))
+    except Exception:
+        enabled = False
+
+    VOICE_ENABLED[user_id] = enabled
+    return enabled
+
+
+def set_voice_enabled(user_id: int, enabled: bool) -> None:
+    """Set voice-enabled setting for a user (cache + persist)."""
+    VOICE_ENABLED[user_id] = bool(enabled)
+
+    try:
+        lm = LongMemory(user_id)
+        if hasattr(lm, "data"):
+            lm.data["voice_enabled"] = bool(enabled)  # type: ignore[attr-defined]
+            lm.save()
+    except Exception as e:
+        print("[Voice] Failed to persist voice_enabled:", e)
+
+
+def truncate_for_tts(text: str, max_chars: int = 220) -> str:
+    """Keep auto-TTS short so it doesn't drone."""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut + "..."
+
+
+# =========================
 # Language filter
 # =========================
 
@@ -67,10 +114,7 @@ def looks_english(text: str) -> bool:
 
     # Count hits on common English words.
     lower = text.lower()
-    hits = sum(
-        1 for w in COMMON_ENGLISH_WORDS
-        if re.search(rf"\b{w}\b", lower)
-    )
+    hits = sum(1 for w in COMMON_ENGLISH_WORDS if re.search(rf"\b{w}\b", lower))
     return hits >= 1
 
 
@@ -143,7 +187,7 @@ def parse_at_time(text: str) -> dict | None:
         else:
             hour = 12 if h12 == 12 else h12 + 12
 
-    # crude text extraction (LLM extraction below is better)
+    # crude text extraction
     reminder_text = text
     if "remind me" in t:
         reminder_text = text.lower().split("remind me", 1)[1].strip()
@@ -300,10 +344,31 @@ async def on_message(message: discord.Message):
     if message.channel.id not in ALLOWED_CHANNEL_IDS:
         return
 
+    # !voice on/off/status (auto-speak AI replies)
+    if content.lower().startswith("!voice"):
+        arg = content[6:].strip().lower()
+        uid = message.author.id
+
+        if arg in {"on", "enable", "true", "1"}:
+            set_voice_enabled(uid, True)
+            await message.channel.send("🔊 Voice replies: **ON**")
+            return
+
+        if arg in {"off", "disable", "false", "0"}:
+            set_voice_enabled(uid, False)
+            await message.channel.send("🔇 Voice replies: **OFF**")
+            return
+
+        state = get_voice_enabled(uid)
+        await message.channel.send(
+            f"Voice replies are currently: **{'ON' if state else 'OFF'}**\n"
+            "Use `!voice on` or `!voice off`."
+        )
+        return
+
     # =========================
     # English-only filter (optional)
     # =========================
-    # If you want to hard-enforce English replies:
     # if not looks_english(content):
     #     await message.channel.send("English only, please. 💜")
     #     return
@@ -398,13 +463,17 @@ async def on_message(message: discord.Message):
         # Decay emotion
         emotion.decay()
 
-        # Mood logging (support both old/new emotion APIs)
-        mood_val = emotion.value() if hasattr(emotion, "value") else emotion.to_int()
-        mood_label = emotion.label() if hasattr(emotion, "label") else ""
-        print(f"MOOD {mood_val} ({mood_label})")
-
         print(f"AI -> {username}: {reply}")
         await message.channel.send(reply)
+
+        # Auto-speak in VC if user enabled voice
+        if get_voice_enabled(user_id):
+            if message.author.voice and message.author.voice.channel:
+                spoken = truncate_for_tts(reply, max_chars=220)
+                try:
+                    await handle_tts_command(message, spoken)
+                except Exception as e:
+                    print("[TTS] auto-voice failed:", e)
 
     except Exception as e:
         print("Bot error:", e)

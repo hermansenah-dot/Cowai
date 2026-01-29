@@ -19,6 +19,7 @@ class Long_Term_Memory:
     - name
     - preferred_language
     - likes / dislikes
+    - voice_enabled (whether the bot should auto-speak AI replies for this user)
     """
 
     def __init__(self, user_id: int):
@@ -27,15 +28,21 @@ class Long_Term_Memory:
 
         self.file_path = BASE_DIR / f"{self.user_id}.json"
 
-        # Default schema
+        # Default schema (backwards compatible; missing keys are filled on load)
         self.data: Dict[str, Any] = {
             "name": None,
             "preferred_language": "English",
             "likes": [],
             "dislikes": [],
+            "voice_enabled": False,
         }
 
         self.load()
+
+        # Ensure older files get new keys
+        if "voice_enabled" not in self.data:
+            self.data["voice_enabled"] = False
+            self.save()
 
     # ------------------
     # Persistence
@@ -44,7 +51,9 @@ class Long_Term_Memory:
     def load(self) -> None:
         if self.file_path.exists():
             try:
-                self.data = json.loads(self.file_path.read_text(encoding="utf-8"))
+                loaded = json.loads(self.file_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    self.data.update(loaded)
             except Exception as e:
                 print(f"[Memory] Failed to load {self.user_id}: {e}")
 
@@ -62,6 +71,13 @@ class Long_Term_Memory:
     # ------------------
 
     def update_from_text(self, text: str) -> None:
+        """
+        Update memory from free-form user text.
+
+        Important:
+        - We only store stable facts (name, prefs, likes/dislikes).
+        - Voice toggling is done via the !voice command and stored directly.
+        """
         changed = False
 
         changed |= self._extract_name(text)
@@ -92,7 +108,6 @@ class Long_Term_Memory:
     def _extract_language(self, text: str) -> bool:
         t = text.lower()
 
-        # Keep it simple (you can expand later)
         if "english" in t:
             return self._set("preferred_language", "English")
         if "danish" in t:
@@ -153,4 +168,5 @@ class Long_Term_Memory:
         if dislikes:
             parts.append("The user dislikes: " + ", ".join(dislikes) + ".")
 
+        # Do NOT inject voice_enabled into the prompt (it's behavior config)
         return " ".join(parts)
