@@ -1,22 +1,164 @@
-import discord
-import time
-import json
-import re
+"""
+Discord AI bot (chat + commands)
+
+Key rules:
+- The bot only responds in ALLOWED_CHANNEL_IDS.
+- Reminders are created ONLY via the explicit `!reminder ...` command.
+- Commands live in commands.py (single source of truth).
+
+Notes:
+- ask_llama() is synchronous, so we run it in a thread to avoid blocking Discord's event loop.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import re
+import time
+from pathlib import Path
+from datetime import datetime
+from typing import Optional
+
+import discord
 import pytz
-from datetime import datetime, timedelta
 
+from ai import ask_llama
+from config import DISCORD_TOKEN, ALLOWED_CHANNEL_IDS
+from emotion import emotion
+from personality.memory_long import Long_Term_Memory
+from personality.memory_short import get_short_memory
+from reminders import ReminderStore, reminder_loop
+from triggers import analyze_input
 
+# Centralized command router
+from commands import handle_commands, get_voice_enabled, maybe_speak_reply
+# =========================
+# Configuration
+# =========================
+
+# Discord hard-limit is 2000 chars; we keep replies shorter for readability.
 DISCORD_MAX = 2000
 
-def split_for_discord(text: str, max_len: int = 750, max_parts: int = 5, max_sentences_per_chunk: int = 5) -> list[str]:
-    """Split a reply into several Discord messages (more aggressive).
+# Only respond in these channels (hard gate).
+# Defined in config.py as ALLOWED_CHANNEL_IDS.
+
+# Default timezone for reminders / timestamps.
+DEFAULT_TZ = pytz.timezone("Europe/Copenhagen")
+
+# Resolve file paths relative to this script (so running from another working directory still works)
+BASE_DIR = Path(__file__).resolve().parent
+
+# Path to the banned-words list (one lowercase word per line).
+# Lines starting with "#" are comments.
+BANNED_WORDS_FILE = str(BASE_DIR / "banned_words.txt")
+
+
+# Where we log censorship events (appends one line per censored AI reply).
+CENSOR_LOG_FILE = str(BASE_DIR / "logs" / "filtered_words.txt")
+
+
+def log_censorship(filtered_counts: dict[str, int]) -> None:
+    """
+    Append a censorship event to CENSOR_LOG_FILE.
+
+    Format:
+      [YYYY-MM-DD HH:MM:SS] filtered: word1(x2), word2(x1)
+    """
+    if not filtered_counts:
+        return
+
+    ts = datetime.now(DEFAULT_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    items = ", ".join(f"{w}(x{n})" for w, n in sorted(filtered_counts.items()))
+    log_line = f"[{ts}] filtered: {items}\n"
+
+    try:
+        # Ensure the logs folder exists
+        Path(CENSOR_LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+
+        with open(CENSOR_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_line)
+    except Exception as e:
+        # Logging should never break the bot, but we do want visibility.
+        try:
+            print(f"[{ts}] censor log write failed: {e} | path={CENSOR_LOG_FILE}")
+        except Exception:
+            pass
+
+def load_banned_words(path: str = BANNED_WORDS_FILE) -> set[str]:
+    """Load banned words from a text file (one word per line)."""
+    words: set[str] = set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                words.add(line.lower())
+    except FileNotFoundError:
+        # If the file doesn't exist, just keep the filter disabled.
+        pass
+    return words
+
+
+BANNED_WORDS: set[str] = load_banned_words()
+
+
+def filter_banned_words(text: str) -> str:
+    """
+    Censor banned words in AI replies.
+
+    - Whole-word match (case-insensitive).
+    - Replaces the matched word with asterisks of the same length.
+    """
+    if not text or not BANNED_WORDS:
+        return text
+
+    filtered_counts: dict[str, int] = {}
+
+    out = text
+    for w in sorted(BANNED_WORDS, key=len, reverse=True):
+        # Whole-word boundary to avoid censoring parts of other words.
+        pattern = re.compile(rf"\b{re.escape(w)}\b", re.IGNORECASE)
+        out, n = pattern.subn("*FILTERED!*", out)
+        if n:
+            filtered_counts[w] = filtered_counts.get(w, 0) + int(n)
+
+    if filtered_counts:
+        log_censorship(filtered_counts)
+
+    return out
+
+
+
+def log(message: str) -> None:
+    """Print console messages with a local timestamp (Europe/Copenhagen)."""
+    ts = datetime.now(DEFAULT_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {message}")
+
+
+# Prevent spamming “ready” messages on reconnects.
+READY_ANNOUNCED = False
+
+
+# =========================
+# Utilities: message splitting
+# =========================
+
+def split_for_discord(
+    text: str,
+    *,
+    max_len: int = 750,
+    max_parts: int = 5,
+    max_sentences_per_chunk: int = 5,
+) -> list[str]:
+    """
+    Split a reply into multiple Discord messages.
 
     Strategy:
     - Prefer sentence boundaries.
     - Aim for <= max_sentences_per_chunk sentences per message.
-    - Also respect max_len to avoid Discord limits.
-    - Cap at max_parts to prevent spam.
+    - Respect max_len (Discord has a hard 2000 char limit).
+    - Cap at max_parts to avoid spam.
     """
     text = (text or "").strip()
     if not text:
@@ -25,13 +167,13 @@ def split_for_discord(text: str, max_len: int = 750, max_parts: int = 5, max_sen
     # Normalize whitespace/newlines
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
-    # Split into sentences
+    # Sentence-ish splitting (keeps punctuation)
     sentences = re.split(r"(?<=[.!?])\s+", text)
 
     chunks: list[str] = []
     buf: list[str] = []
 
-    def flush():
+    def flush() -> None:
         nonlocal buf
         if buf:
             chunks.append(" ".join(buf).strip())
@@ -42,16 +184,16 @@ def split_for_discord(text: str, max_len: int = 750, max_parts: int = 5, max_sen
         if not s:
             continue
 
-        # If a single sentence is huge, hard-split it
+        # If a single sentence is huge, hard-split it.
         if len(s) > max_len:
             flush()
             start = 0
             while start < len(s) and len(chunks) < max_parts:
-                chunks.append(s[start:start + max_len].strip())
+                chunks.append(s[start : start + max_len].strip())
                 start += max_len
             continue
 
-        candidate = (" ".join(buf + [s])).strip()
+        candidate = " ".join(buf + [s]).strip()
         if len(candidate) <= max_len and (len(buf) + 1) <= max_sentences_per_chunk:
             buf.append(s)
         else:
@@ -64,355 +206,121 @@ def split_for_discord(text: str, max_len: int = 750, max_parts: int = 5, max_sen
     if len(chunks) < max_parts:
         flush()
 
+    # If we hit the cap, add a visible truncation marker.
     if chunks and len(chunks) == max_parts:
         chunks[-1] = chunks[-1].rstrip() + " …"
 
     return chunks[:max_parts]
 
 
-async def send_split_message(channel, text: str, *, max_len: int = 750, max_parts: int = 8, delay: float = 0.25) -> None:
-    """Send text as multiple Discord messages (aggressive splitting)."""
-    parts = split_for_discord(text, max_len=max_len, max_parts=max_parts, max_sentences_per_chunk=5)
+async def send_split_message(
+    channel: discord.abc.Messageable,
+    text: str,
+    *,
+    max_len: int = 750,
+    max_parts: int = 8,
+    delay: float = 0.25,
+) -> None:
+    """Send `text` as multiple Discord messages using `split_for_discord`."""
+    parts = split_for_discord(
+        text,
+        max_len=max_len,
+        max_parts=max_parts,
+        max_sentences_per_chunk=5,
+    )
+
     for i, chunk in enumerate(parts):
         await channel.send(chunk)
         if delay and i != len(parts) - 1:
             await asyncio.sleep(delay)
 
-# ---- Internal modules ----
-
-from ai import ask_llama
-from triggers import analyze_input
-from emotion import emotion
-from personality.memory_short import get_short_memory
-from personality.memory_long import Long_Term_Memory
-from reminders import ReminderStore, reminder_loop, Reminder
-from config import DISCORD_TOKEN
-
-ALLOWED_CHANNEL_IDS = {
-    800899430927826975,  # ai-chat
-    1466093268755415328,  # testing
-}
-
-def looks_english(text: str) -> bool:
-    """
-    Heuristic check for English text.
-    Returns False for messages that look non-English.
-    """
-
-
-    # Too short → ignore
-    if len(text) < 2:
-        return False
-
-    # If it has a lot of non-latin letters, ignore
-    non_latin = re.findall(r"[^\x00-\x7F]", text)
-    if len(non_latin) > 2:
-        return False
-
-    # Common English words check
-    english_hits = sum(
-        1 for w in ["the", "and", "you", "is", "to", "of", "that", "it"]
-        if re.search(rf"\b{w}\b", text.lower())
-    )
-
-    return english_hits >= 1
 
 # =========================
-# Reminder system
+# Discord client setup
 # =========================
+
+intents = discord.Intents.default()
+intents.message_content = True  # required to read message content
+
+client = discord.Client(intents=intents)
 
 # Persistent reminder store (survives restarts)
 store = ReminderStore()
 
-# Default timezone
-DEFAULT_TZ = pytz.timezone("Europe/Copenhagen")
-
-
-def parse_in_minutes(text: str):
-    """
-    Rule-based parser for:
-      "remind me in 10 minutes drink water"
-    Returns:
-      int minutes or None
-    """
-    t = text.lower()
-    if "remind me in" not in t:
-        return None
-
-    after = t.split("remind me in", 1)[1].strip()
-    parts = after.split()
-    if not parts:
-        return None
-
-    try:
-        mins = int(parts[0])
-    except ValueError:
-        return None
-
-    if "minute" not in after:
-        return None
-
-    return mins
-
-
-def parse_at_time(text: str):
-    """
-    Rule-based absolute time parser for common patterns.
-    Supports:
-      - "remind me at 18:30 to call mom"
-      - "at 6pm remind me to stand up"
-      - "remind me tomorrow at 07:15 check email"
-    Returns:
-      dict { "hour": int, "minute": int, "day_offset": 0|1, "text": str } or None
-    """
-    t = text.lower().strip()
-
-    # Require "remind" somewhere so we don't treat random chat as a reminder
-    if "remind" not in t:
-        return None
-
-    day_offset = 1 if "tomorrow" in t else 0
-
-    # 24h format: HH:MM
-    m = re.search(r"\b(at\s*)?([01]?\d|2[0-3]):([0-5]\d)\b", t)
-    hour = minute = None
-
-    if m:
-        hour = int(m.group(2))
-        minute = int(m.group(3))
-    else:
-        # 12h format: H(am/pm) or H:MM(am/pm)
-        m2 = re.search(r"\b(at\s*)?([1-9]|1[0-2])(?::([0-5]\d))?\s*(am|pm)\b", t)
-        if not m2:
-            return None
-        h12 = int(m2.group(2))
-        minute = int(m2.group(3)) if m2.group(3) else 0
-        ampm = m2.group(4)
-        if ampm == "am":
-            hour = 0 if h12 == 12 else h12
-        else:
-            hour = 12 if h12 == 12 else h12 + 12
-
-    # Extract reminder text: take everything after "remind me" if possible, else after time
-    reminder_text = None
-
-    if "remind me" in t:
-        reminder_text = text.lower().split("remind me", 1)[1].strip()
-    else:
-        reminder_text = text.strip()
-
-    # Clean the reminder text a bit (remove obvious timing phrases)
-    # This is intentionally simple; LLM extraction below will do better.
-    for token in ["tomorrow", "at", "am", "pm"]:
-        reminder_text = reminder_text.replace(token, " ")
-
-    reminder_text = " ".join(reminder_text.split()).strip(" .!-")
-    if not reminder_text:
-        reminder_text = "You asked me to remind you."
-
-    return {"hour": hour, "minute": minute, "day_offset": day_offset, "text": reminder_text}
-
-
-def build_due_ts_absolute(hour: int, minute: int, day_offset: int, tz=DEFAULT_TZ) -> float:
-    """
-    Convert an absolute (hour, minute) to a unix timestamp using pytz.
-    """
-    now = datetime.now(tz)
-
-    target = now.replace(
-        hour=hour,
-        minute=minute,
-        second=0,
-        microsecond=0
-    )
-
-    if day_offset == 1:
-        target = target + timedelta(days=1)
-
-    if day_offset == 0 and target <= now:
-        target = target + timedelta(days=1)
-
-    return target.timestamp()
-
-
-def llm_extract_reminder(user_text: str):
-    """
-    Natural language reminder extraction (safe).
-    The LLM outputs strict JSON ONLY. Python validates and schedules.
-
-    Supported:
-      - Relative: "in 10 minutes", "in an hour", "half an hour"
-      - Absolute: "at 18:30", "tomorrow at 7", "at 6pm"
-    """
-    extraction_messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a strict JSON extraction tool. Output JSON ONLY.\n"
-                "Detect whether the user wants to set a reminder.\n\n"
-                "Schema:\n"
-                "{\n"
-                '  "intent": "set_reminder" | "none",\n'
-                '  "time_type": "relative" | "absolute" | null,\n'
-                '  "delay_minutes": integer | null,\n'
-                '  "hour": integer | null,\n'
-                '  "minute": integer | null,\n'
-                '  "day_offset": integer | null,\n'
-                '  "text": string | null\n'
-                "}\n\n"
-                "Rules:\n"
-                "- If NOT a reminder request: intent='none'.\n"
-                "- If time_type='relative': set delay_minutes (e.g. 10). hour/minute/day_offset must be null.\n"
-                "- If time_type='absolute': set hour (0-23), minute (0-59), day_offset (0=today, 1=tomorrow). delay_minutes must be null.\n"
-                "- Interpret common durations: 'half an hour'=30, 'an hour'=60, 'a couple minutes'=2, 'a few minutes'=5.\n"
-                "- If the user says 'tomorrow', set day_offset=1.\n"
-                "- text must be the reminder content (short). Remove timing words.\n"
-                "- If you cannot extract safely, return intent='none'.\n"
-            ),
-        },
-        {"role": "user", "content": user_text},
-    ]
-
-    # Use your existing LLM call; keep it deterministic-ish
-    reply = ask_llama(extraction_messages)
-
-    try:
-        data = json.loads(reply)
-    except json.JSONDecodeError:
-        return None
-
-    if not isinstance(data, dict):
-        return None
-    if data.get("intent") != "set_reminder":
-        return None
-
-    time_type = data.get("time_type")
-    text = data.get("text")
-
-    if not isinstance(text, str) or not text.strip():
-        return None
-    text = text.strip()
-
-    if time_type == "relative":
-        delay = data.get("delay_minutes")
-        if not isinstance(delay, int) or delay <= 0 or delay > 24 * 60:
-            return None
-        return {"type": "relative", "delay_minutes": delay, "text": text}
-
-    if time_type == "absolute":
-        hour = data.get("hour")
-        minute = data.get("minute")
-        day_offset = data.get("day_offset", 0)
-
-        if not isinstance(hour, int) or not (0 <= hour <= 23):
-            return None
-        if not isinstance(minute, int) or not (0 <= minute <= 59):
-            return None
-        if not isinstance(day_offset, int) or day_offset not in (0, 1):
-            return None
-
-        return {"type": "absolute", "hour": hour, "minute": minute, "day_offset": day_offset, "text": text}
-
-    return None
-
-
-# =========================
-# Discord setup
-# =========================
-
-intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents)
-
 
 @client.event
-async def on_ready():
-    """Runs once when the bot connects."""
-    print(f"Logged in as {client.user} (ID: {client.user.id})")
+async def on_ready() -> None:
+    """
+    Fired when the bot connects.
+
+    We:
+    - print an info line
+    - start the reminder loop
+    - announce readiness in allowed channels (once per process)
+    """
+    global READY_ANNOUNCED
+
+    log(f"Logged in as {client.user} (ID: {client.user.id})")
 
     # Start background reminder scheduler
-    client.loop.create_task(reminder_loop(client, store))
+    asyncio.create_task(reminder_loop(client, store))
+
+    # Announce readiness only once per process (avoid reconnect spam)
+    if READY_ANNOUNCED:
+        return
+    READY_ANNOUNCED = True
+
+    ready_msg = "✅ I’m online."
+    for ch_id in ALLOWED_CHANNEL_IDS:
+        try:
+            channel = client.get_channel(ch_id) or await client.fetch_channel(ch_id)
+            await channel.send(ready_msg)
+        except Exception as e:
+            log(f"Ready message failed for channel {ch_id}: {e}")
 
 
 @client.event
-async def on_message(message):
+async def on_message(message: discord.Message) -> None:
     """
     Main message handler.
-    Order matters:
-    1) Ignore self
-    2) Handle reminders
-    3) Handle AI conversation
-    """
 
+    Order:
+    1) Ignore self / empty messages
+    2) Enforce allowed channels (return early)
+    3) Route commands to commands.py (single source of truth)
+    4) Otherwise: normal AI chat
+    """
     # Ignore messages from the bot itself
     if message.author == client.user:
         return
 
-    content = message.content.strip()
+    content = (message.content or "").strip()
+    if not content:
+        return
 
-    # 👇 channel restriction
+    # Channel restriction (hard gate)
     if message.channel.id not in ALLOWED_CHANNEL_IDS:
         return
 
-    # Ignore non-English messages
-    # if not looks_english(content):
-    #    return
-
-    # =========================
-    # Reminder handling
-    # =========================
-
-    # 1) Fast path: your simple "in X minutes" parser
-    mins = parse_in_minutes(content)
-    reminder_text = None
-    due_ts = None
-
-    if mins is not None:
-        reminder_text = content.split("minutes", 1)[-1].strip() or "You asked me to remind you."
-        due_ts = time.time() + mins * 60
-
-    # 2) Fast-ish absolute parser (rule-based)
-    if due_ts is None:
-        abs_parsed = parse_at_time(content)
-        if abs_parsed:
-            reminder_text = abs_parsed["text"]
-            due_ts = build_due_ts_absolute(abs_parsed["hour"], abs_parsed["minute"], abs_parsed["day_offset"])
-
-    # 3) Natural language fallback via LLM (relative or absolute)
-    if due_ts is None:
-        extracted = llm_extract_reminder(content)
-        if extracted:
-            reminder_text = extracted["text"]
-            if extracted["type"] == "relative":
-                mins = extracted["delay_minutes"]
-                due_ts = time.time() + mins * 60
-            else:
-                due_ts = build_due_ts_absolute(extracted["hour"], extracted["minute"], extracted["day_offset"])
-
-    # If we managed to schedule anything, do it and confirm
-    if due_ts is not None and reminder_text is not None:
-        store.add(Reminder(
-            due_ts=due_ts,
-            channel_id=message.channel.id,
-            user_id=message.author.id,
-            text=reminder_text
-        ))
-
-        # 24h confirmation time in server timezone (DEFAULT_TZ)
-        time_str = datetime.fromtimestamp(due_ts, DEFAULT_TZ).strftime("%H:%M")
-
-        await message.channel.send(
-            f"⏰ Got it.\n"
-            f"I’ll remind you at **{time_str}**.\n"
-            f"Message: *{reminder_text}* 😊"
+    # -------------------------
+    # 1) Commands
+    # -------------------------
+    # All command handling lives in commands.py.
+    if content.startswith("!"):
+        handled = await handle_commands(
+            message,
+            content,
+            store=store,
+            default_tz=DEFAULT_TZ,
+            LongMemory=Long_Term_Memory,
         )
-        return  # Do NOT continue to AI logic
+        if handled:
+            return
 
-    # =========================
-    # AI conversation handling
-    # =========================
-
-    # Strip bot mention if present
+    # -------------------------
+    # 2) AI conversation
+    # -------------------------
+    # Remove bot mention (common when users ping the bot)
     user_text = content.replace(f"<@{client.user.id}>", "").strip()
     if not user_text:
         return
@@ -420,51 +328,74 @@ async def on_message(message):
     username = message.author.display_name
     user_id = message.author.id
 
-    print(f"USER {username}: {user_text}")
+    log(f"{username}: {user_text}")
 
     try:
-        # Get per-user memory
+        # --- Per-user memory ---
         short_memory = get_short_memory(user_id)
-        long_memory = Long_Term_Memory(user_id)
+        long_memory = Long_Term_Memory(user_id)  # keep long-term memory behavior unchanged
 
-        # Emotion processing
+        # --- Emotion processing ---
         delta = analyze_input(user_text)
         emotion.apply(delta)
 
-        # Update long-term memory
+        # --- Update long-term memory ---
         long_memory.update_from_text(user_text)
 
-        # Refresh system prompt (persona + emotion + time)
+        # --- Refresh system prompt (persona + emotion + time) ---
         short_memory.refresh_system()
 
-        # Inject long-term facts as system info
-        short_memory.messages[0]["content"] += (
-            "\n\nKnown facts:\n" + long_memory.as_prompt()
-        )
+        # --- Inject long-term facts as system info ---
+        # Guard against empty/invalid short_memory.messages to avoid "list index out of range"
+        if not hasattr(short_memory, "messages") or short_memory.messages is None:
+            short_memory.messages = []
 
-        # Add user message
+        if len(short_memory.messages) == 0:
+            short_memory.messages.append({"role": "system", "content": ""})
+        elif (
+            not isinstance(short_memory.messages[0], dict)
+            or short_memory.messages[0].get("role") != "system"
+        ):
+            short_memory.messages.insert(0, {"role": "system", "content": ""})
+
+        facts = (long_memory.as_prompt() or "").rstrip(" |\n")
+        if facts:
+            short_memory.messages[0]["content"] += f"\n\nKnown facts:\n{facts}"
+
+        # --- Add user message to short-term memory ---
         short_memory.add("user", user_text)
 
-        # Build chat messages for Ollama
+        # Build chat messages for the LLM
         messages = short_memory.get_messages()
 
-        # Ask LLM (non-blocking) + typing indicator
+        # ask_llama is synchronous; run it in a thread so Discord doesn't lag.
         async with message.channel.typing():
             reply = await asyncio.to_thread(ask_llama, messages)
 
-        # Store assistant reply
+        # Censor banned words in the AI reply before sending
+        reply = filter_banned_words(reply)
+
+        # Store assistant reply in short-term memory
         short_memory.add("assistant", reply)
 
-        # Emotion decay over time
+        # Emotion decay over time (keeps mood from sticking forever)
         emotion.decay()
 
-        print(f"AI response to {username}: {reply}")
+        log(f"AI > {username}: {reply}")
         await send_split_message(message.channel, reply)
 
-        print(f"MOOD {emotion.value()} ({emotion.label()}) | USER {username}: {user_text}")
+        # Optional: auto-voice replies if the user enabled it via !voice on
+        try:
+            if get_voice_enabled(user_id, Long_Term_Memory):
+                await maybe_speak_reply(message, reply)
+        except Exception as e:
+            # Voice is optional; don't let it break chat.
+            log(f"[Voice] Failed: {e}")
+
+        log(f"MOOD {emotion.value()} ({emotion.label()})")
 
     except Exception as e:
-        print("Bot error:", e)
+        log(f"Bot error: {e}")
         await message.channel.send("There is an issue with my AI.")
 
 
