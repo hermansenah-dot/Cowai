@@ -31,7 +31,7 @@ from reminders import ReminderStore, reminder_loop
 from triggers import analyze_input
 
 # Centralized command router
-from commands import handle_commands, get_voice_enabled, maybe_speak_reply
+from commands import handle_commands, maybe_auto_voice_reply
 # =========================
 # Configuration
 # =========================
@@ -339,7 +339,7 @@ async def on_message(message: discord.Message) -> None:
         delta = analyze_input(user_text)
         emotion.apply(delta)
 
-        # --- Update long-term memory ---
+        # --- Update long-term memory (fast rules) ---
         long_memory.update_from_text(user_text)
 
         # --- Refresh system prompt (persona + emotion + time) ---
@@ -358,9 +358,15 @@ async def on_message(message: discord.Message) -> None:
         ):
             short_memory.messages.insert(0, {"role": "system", "content": ""})
 
-        facts = (long_memory.as_prompt() or "").rstrip(" |\n")
-        if facts:
-            short_memory.messages[0]["content"] += f"\n\nKnown facts:\n{facts}"
+        mem_block = (long_memory.as_prompt(user_text) or "").strip()
+        if mem_block:
+            short_memory.messages[0]["content"] += "\n\n" + mem_block
+
+        # --- Record message to long-term store (for episodic extraction) ---
+        try:
+            long_memory.record_message("user", user_text)
+        except Exception:
+            pass
 
         # --- Add user message to short-term memory ---
         short_memory.add("user", user_text)
@@ -378,6 +384,18 @@ async def on_message(message: discord.Message) -> None:
         # Store assistant reply in short-term memory
         short_memory.add("assistant", reply)
 
+        # Record assistant reply to long-term store
+        try:
+            long_memory.record_message("assistant", reply)
+        except Exception:
+            pass
+
+        # Periodically extract structured facts/episodes in the background
+        try:
+            asyncio.create_task(asyncio.to_thread(long_memory.maybe_extract, ask_llama))
+        except Exception:
+            pass
+
         # Emotion decay over time (keeps mood from sticking forever)
         emotion.decay()
 
@@ -386,13 +404,17 @@ async def on_message(message: discord.Message) -> None:
 
         # Optional: auto-voice replies if the user enabled it via !voice on
         try:
-            if get_voice_enabled(user_id, Long_Term_Memory):
-                await maybe_speak_reply(message, reply)
+            await maybe_auto_voice_reply(message, reply, Long_Term_Memory)
         except Exception as e:
             # Voice is optional; don't let it break chat.
             log(f"[Voice] Failed: {e}")
 
-        log(f"MOOD {emotion.value()} ({emotion.label()})")
+        m = emotion.metrics()
+        log(
+            "MOOD "
+            f"{emotion.label()} "
+            f"(int={emotion.value():+d}, V={m['valence']:+.2f}, A={m['arousal']:+.2f}, D={m['dominance']:+.2f})"
+        )
 
     except Exception as e:
         log(f"Bot error: {e}")
