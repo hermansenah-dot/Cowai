@@ -14,6 +14,8 @@ Commands in this file:
 
 from __future__ import annotations
 
+import asyncio
+
 import json
 import re
 import time
@@ -22,8 +24,46 @@ from typing import Any, Dict, Optional
 
 import discord
 
-from tts_coqui import handle_tts_command, handle_tts_lines
 from reminders import Reminder, ReminderStore
+
+
+# =========================
+# Optional TTS (Coqui) lazy import
+# =========================
+# Coqui TTS is *heavy* to import and can be slow on startup. We only import it
+# when the user actually runs a TTS/voice command.
+_TTS_FUNCS = None  # (handle_tts_command, handle_tts_lines)
+_TTS_IMPORT_ERROR: Exception | None = None
+
+
+def _load_tts():
+    """Try importing Coqui TTS handlers once; cache the result."""
+    global _TTS_FUNCS, _TTS_IMPORT_ERROR
+    if _TTS_FUNCS is not None:
+        return _TTS_FUNCS
+    if _TTS_IMPORT_ERROR is not None:
+        return None
+
+    try:
+        from tts_coqui import handle_tts_command, handle_tts_lines  # type: ignore
+        _TTS_FUNCS = (handle_tts_command, handle_tts_lines)
+        return _TTS_FUNCS
+    except Exception as e:
+        _TTS_IMPORT_ERROR = e
+        return None
+
+
+def _tts_unavailable_message() -> str:
+    """User-facing hint when TTS isn’t available."""
+    # Keep this short; the real error prints to console.
+    hint = (
+        "TTS isn’t available right now (Coqui failed to import).\n"
+        "If you’re on Python 3.13, Coqui TTS may not be compatible yet—"
+        "try Python 3.10/3.11 in a fresh venv.\n"
+        "You can still use the bot normally without voice."
+    )
+    return hint
+
 from ai import ask_llama
 
 
@@ -32,6 +72,25 @@ from ai import ask_llama
 # -------------------------
 
 VOICE_ENABLED: Dict[int, bool] = {}
+
+
+
+async def maybe_speak_reply(message: discord.Message, reply: str) -> None:
+    """Speak an AI reply if voice mode is enabled for this user (lazy-loads TTS)."""
+    if not get_voice_enabled(message.author.id):
+        return
+
+    tts = _load_tts()
+    if not tts:
+        # Don't spam the channel; log once to console.
+        print("TTS unavailable:", _TTS_IMPORT_ERROR)
+        return
+
+    _, handle_tts_lines = tts
+    try:
+        await handle_tts_lines(message, reply)
+    except Exception as e:
+        print("TTS speak error:", e)
 
 
 def get_voice_enabled(user_id: int, LongMemory) -> bool:
@@ -134,6 +193,11 @@ async def maybe_auto_voice_reply(message: discord.Message, reply: str, LongMemor
 
     lines = chunk_text_for_tts(reply, max_chars=260, max_parts=6)
     try:
+        tts = _load_tts()
+        if not tts:
+            await message.channel.send(_tts_unavailable_message())
+            return
+        _, handle_tts_lines = tts
         await handle_tts_lines(message, lines)
 
     except Exception as e:
@@ -333,6 +397,11 @@ async def handle_commands(
             await message.channel.send("Usage: `!tts your text here`")
             return True
 
+        tts = _load_tts()
+        if not tts:
+            await message.channel.send(_tts_unavailable_message())
+            return True
+        handle_tts_command, _ = tts
         await handle_tts_command(message, text)
         return True
 
@@ -393,7 +462,7 @@ async def handle_commands(
 
         # LLM fallback — ONLY because user explicitly typed !reminder
         if due_ts is None:
-            extracted = llm_extract_reminder(reminder_input)
+            extracted = await asyncio.to_thread(llm_extract_reminder, reminder_input)
             if extracted:
                 reminder_text = extracted["text"]
                 if extracted["type"] == "relative":

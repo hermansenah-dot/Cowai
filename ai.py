@@ -24,7 +24,6 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 
 # Must exist in `ollama list` OR be a valid pulled reference
 MODEL = "hf.co/joshnader/Meta-Llama-3.1-8B-Instruct-Q4_K_M-GGUF:Q4_K_M"
-
 NUM_PREDICT = 750
 TEMPERATURE = 1
 
@@ -60,6 +59,10 @@ def clean_special_tokens(text: str) -> str:
     # Extra safety: remove known tokens explicitly
     for tok in STOP_TOKENS:
         text = text.replace(tok, "")
+
+    # Remove a common delimiter artifact: a lone trailing pipe at end of message
+    # (Do NOT remove pipes elsewhere, to avoid breaking markdown tables.)
+    text = re.sub(r"[ \t]*\|\s*$", "", text)
 
     return text.strip()
 
