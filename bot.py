@@ -21,6 +21,7 @@ from typing import Optional
 
 import discord
 import pytz
+import uptime
 
 from ai import ask_llama
 from config import DISCORD_TOKEN, ALLOWED_CHANNEL_IDS
@@ -29,6 +30,7 @@ from personality.memory_long import Long_Term_Memory
 from personality.memory_short import get_short_memory
 from reminders import ReminderStore, reminder_loop
 from triggers import analyze_input
+from trust import trust
 
 # Centralized command router
 from commands import handle_commands, maybe_auto_voice_reply
@@ -44,6 +46,9 @@ DISCORD_MAX = 2000
 
 # Default timezone for reminders / timestamps.
 DEFAULT_TZ = pytz.timezone("Europe/Copenhagen")
+
+# Uptime tracker
+uptime.TRACKER = uptime.UptimeTracker.start(DEFAULT_TZ)
 
 # Resolve file paths relative to this script (so running from another working directory still works)
 BASE_DIR = Path(__file__).resolve().parent
@@ -247,6 +252,31 @@ intents.message_content = True  # required to read message content
 
 client = discord.Client(intents=intents)
 
+# Reconnect tracker
+
+@client.event
+async def on_connect() -> None:
+    if uptime.TRACKER:
+        uptime.TRACKER.mark_connect()
+        # Optional log for reconnects only:
+        if uptime.TRACKER.reconnects > 0:
+            log(f"[Uptime] Reconnected to Discord (#{uptime.TRACKER.reconnects}).")
+
+
+@client.event
+async def on_disconnect() -> None:
+    if uptime.TRACKER:
+        uptime.TRACKER.mark_disconnect()
+    log("[Uptime] Disconnected from Discord.")
+
+
+@client.event
+async def on_resumed() -> None:
+    if uptime.TRACKER:
+        uptime.TRACKER.mark_resume()
+    log("[Uptime] Session resumed.")
+
+
 # Persistent reminder store (survives restarts)
 store = ReminderStore()
 
@@ -283,6 +313,7 @@ async def on_ready() -> None:
             try:
                 await warmup_tts()
                 log("[Voice] coqui-TTS warmup complete.")
+                log("✅ I’m online and ready to chat!")
             except Exception as e:
                 log(f"[Voice] coqui-TTS warmup failed: {e}")
 
@@ -292,10 +323,6 @@ async def on_ready() -> None:
     if READY_ANNOUNCED:
         return
     READY_ANNOUNCED = True
-
-    # Console-only readiness confirmation.
-    log("✅ I’m online.")
-
 
 @client.event
 async def on_message(message: discord.Message) -> None:
@@ -353,8 +380,25 @@ async def on_message(message: discord.Message) -> None:
         short_memory = get_short_memory(user_id)
         long_memory = Long_Term_Memory(user_id)  # keep long-term memory behavior unchanged
 
+        # --- Trust context (per-user) ---
+        tstyle = None
+        trust_block = None
+        try:
+            tstyle = trust.style(user_id)
+            trust_block = trust.prompt_block(user_id)
+        except Exception:
+            pass
+
         # --- Emotion processing ---
         delta = analyze_input(user_text)
+
+        # Higher trust => mood impacted more strongly by messages.
+        # Lower trust => less reactive mood.
+        if tstyle is not None:
+            try:
+                delta = int(round(float(delta) * float(tstyle.mood_multiplier)))
+            except Exception:
+                pass
         emotion.apply(delta)
 
         # --- Update long-term memory (fast rules) ---
@@ -377,8 +421,17 @@ async def on_message(message: discord.Message) -> None:
             short_memory.messages.insert(0, {"role": "system", "content": ""})
 
         mem_block = (long_memory.as_prompt(user_text) or "").strip()
+        extras: list[str] = []
+        if trust_block:
+            extras.append(trust_block)
         if mem_block:
-            short_memory.messages[0]["content"] += "\n\n" + mem_block
+            extras.append(mem_block)
+
+        if extras and hasattr(short_memory, "set_system_extras"):
+            try:
+                short_memory.set_system_extras(extras)  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
         # --- Record message to long-term store (for episodic extraction) ---
         try:

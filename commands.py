@@ -23,8 +23,10 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 import discord
+import uptime
 
 from reminders import Reminder, ReminderStore
+from trust import trust
 
 
 # =========================
@@ -34,6 +36,9 @@ from reminders import Reminder, ReminderStore
 # when the user actually runs a TTS/voice command.
 _TTS_FUNCS = None  # (handle_tts_command, handle_tts_lines)
 _TTS_IMPORT_ERROR: Exception | None = None
+
+# uptime
+
 
 
 def _load_tts():
@@ -69,6 +74,16 @@ from ai import ask_llama
 # -------------------------
 
 VOICE_ENABLED: Dict[int, bool] = {}
+
+
+def _is_admin(message: discord.Message) -> bool:
+    try:
+        if not message.guild:
+            return False
+        perms = getattr(message.author, "guild_permissions", None)
+        return bool(perms and getattr(perms, "administrator", False))
+    except Exception:
+        return False
 
 
 
@@ -373,6 +388,78 @@ async def handle_commands(
     Central command router.
     Returns True if a command was handled (caller should return).
     """
+    # ---- !uptime ----
+    if content.lower().startswith("!uptime"):
+        if not uptime.TRACKER:
+            await message.channel.send("Uptime tracker not initialized.")
+            return True
+
+        await message.channel.send(uptime.TRACKER.format_status())
+        return True
+
+    # ---- !trust ----
+    if content.lower().startswith("!trust"):
+        arg = content[len("!trust") :].strip()
+        uid = message.author.id
+
+        if not arg:
+            s = trust.style(uid)
+            await message.channel.send(
+                f"Trust score: **{s.score:.2f} / 1.00**\n"
+                f"Mood impact multiplier: **{s.mood_multiplier:.2f}x**\n"
+                "Use `!trustwhy` to see recent trust events."
+            )
+            return True
+
+        await message.channel.send("Usage: `!trust` or `!trustwhy` (admins: `!trustset`, `!trustadd`)")
+        return True
+
+    # ---- !trustwhy ----
+    if content.lower().startswith("!trustwhy"):
+        uid = message.author.id
+        events = trust.recent_events(uid, limit=6)
+        if not events:
+            await message.channel.send("No trust events recorded yet.")
+            return True
+
+        lines = []
+        for ts, delta, reason in events:
+            sign = "+" if delta > 0 else ""
+            lines.append(f"- {sign}{delta:.2f}: {reason}")
+        await message.channel.send("Recent trust events:\n" + "\n".join(lines))
+        return True
+
+    # ---- !trustset / !trustadd (admin) ----
+    if content.lower().startswith("!trustset") or content.lower().startswith("!trustadd"):
+        if not _is_admin(message):
+            await message.channel.send("You don't have permission to manage trust.")
+            return True
+
+        is_set = content.lower().startswith("!trustset")
+        raw = content.split(maxsplit=2)
+        if len(raw) < 2:
+            await message.channel.send(
+                "Usage: `!trustset <0.0-1.0> [reason]` or `!trustadd <-1.0..+1.0> [reason]`"
+            )
+            return True
+
+        try:
+            value = float(raw[1])
+        except Exception:
+            await message.channel.send("Invalid number.")
+            return True
+
+        reason = raw[2].strip() if len(raw) >= 3 else "admin"
+        uid = message.author.id
+
+        if is_set:
+            new_score = trust.set_score(uid, value, reason=f"trustset: {reason}")
+            await message.channel.send(f"Trust set to **{new_score:.2f}**")
+        else:
+            new_score = trust.add(uid, value, reason=f"trustadd: {reason}")
+            await message.channel.send(f"Trust updated to **{new_score:.2f}**")
+        return True
+
 
     # ---- !tts ----
     if content.lower().startswith("!tts"):

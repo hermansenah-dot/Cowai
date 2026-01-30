@@ -9,7 +9,31 @@ class ShortTermMemory:
     def __init__(self):
         # System message is always index 0
         self.messages = [{"role": "system", "content": ""}]
+        self._system_extras: list[str] = []
         self.refresh_system()
+
+    def _ensure_system_message(self) -> None:
+        if not self.messages:
+            self.messages = [{"role": "system", "content": ""}]
+            return
+
+        first = self.messages[0]
+        if not isinstance(first, dict) or first.get("role") != "system":
+            self.messages.insert(0, {"role": "system", "content": ""})
+
+    def set_system_extras(self, extras) -> None:
+        """Set additional system blocks appended after the base system prompt."""
+        if not extras:
+            self._system_extras = []
+            return
+
+        cleaned: list[str] = []
+        for x in extras:
+            s = str(x).strip()
+            if s:
+                cleaned.append(s)
+
+        self._system_extras = cleaned
 
     def refresh_system(self):
         """Update the system message with persona, emotion and current time."""
@@ -18,13 +42,19 @@ class ShortTermMemory:
             "If the user asks for the time, answer using this value."
         )
 
-        self.messages[0]["content"] = (
+        base = (
             persona_with_emotion(emotion.description())
             + "\n\nIMPORTANT:\n"
             + "Respond in English only. Do not switch languages."
             + "\n\n"
             + time_info
         )
+
+        if self._system_extras:
+            base += "\n\n" + "\n\n".join(self._system_extras)
+
+        self._ensure_system_message()
+        self.messages[0]["content"] = base
 
     def hydrate_from_history(self, history, max_messages: int = MAX_MESSAGES):
         """Rebuild short-term memory from persistent history (e.g., SQLite) after a reboot.
