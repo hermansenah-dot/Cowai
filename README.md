@@ -1,6 +1,6 @@
 ## Cowai (Discord AI Bot)
 
-![Maise](Maise.png)
+<img src="Maise.png" alt="Maise" width="50%" />
 
 A Discord bot that chats via a local Ollama model, supports per-user memory + mood drift, and includes a small command system (reminders + optional voice/TTS).
 
