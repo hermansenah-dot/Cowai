@@ -75,22 +75,9 @@ VOICE_ENABLED: Dict[int, bool] = {}
 
 
 
-async def maybe_speak_reply(message: discord.Message, reply: str) -> None:
-    """Speak an AI reply if voice mode is enabled for this user (lazy-loads TTS)."""
-    if not get_voice_enabled(message.author.id):
-        return
-
-    tts = _load_tts()
-    if not tts:
-        # Don't spam the channel; log once to console.
-        print("TTS unavailable:", _TTS_IMPORT_ERROR)
-        return
-
-    _, handle_tts_lines = tts
-    try:
-        await handle_tts_lines(message, reply)
-    except Exception as e:
-        print("TTS speak error:", e)
+async def maybe_speak_reply(message: discord.Message, reply: str, LongMemory) -> None:
+    """Backward-compatible helper; use maybe_auto_voice_reply for voice replies."""
+    await maybe_auto_voice_reply(message, reply, LongMemory)
 
 
 def get_voice_enabled(user_id: int, LongMemory) -> bool:

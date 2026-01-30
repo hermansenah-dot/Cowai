@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,8 +70,10 @@ class SQLiteMemory:
         if str(parent) != ".":
             parent.mkdir(parents=True, exist_ok=True)
 
-        self.conn = sqlite3.connect(self.db_path)
+        # allow use from asyncio thread executors; serialize writes with a lock
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
         self._init_schema()
 
         # Per-user message counters for "extract every N messages"
@@ -104,7 +107,9 @@ class SQLiteMemory:
                 ts INTEGER NOT NULL,
                 text TEXT NOT NULL,
                 tags TEXT NOT NULL DEFAULT "",
-                importance REAL NOT NULL DEFAULT 0.5
+                importance REAL NOT NULL DEFAULT 0.5,
+                times_used INTEGER NOT NULL DEFAULT 0,
+                last_used_ts INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -125,7 +130,56 @@ class SQLiteMemory:
 
         cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_ts ON messages(user_id, ts DESC)")
 
+        # Lightweight schema migration for older DBs (ALTER TABLE is additive).
+        cur.execute("PRAGMA table_info(episodes)")
+        existing = {str(r["name"]) for r in cur.fetchall()}
+        if "times_used" not in existing:
+            cur.execute("ALTER TABLE episodes ADD COLUMN times_used INTEGER NOT NULL DEFAULT 0")
+        if "last_used_ts" not in existing:
+            cur.execute("ALTER TABLE episodes ADD COLUMN last_used_ts INTEGER NOT NULL DEFAULT 0")
+
         self.conn.commit()
+
+    # -------------------------
+    # Housekeeping
+    # -------------------------
+
+    def prune(self, user_id: int, *, keep_episodes: int = 600, keep_messages: int = 300) -> None:
+        """Keep DB size bounded per user."""
+        uid = str(user_id)
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                DELETE FROM episodes
+                WHERE user_id=?
+                  AND id NOT IN (
+                    SELECT id FROM episodes WHERE user_id=? ORDER BY ts DESC LIMIT ?
+                  )
+                """,
+                (uid, uid, int(keep_episodes)),
+            )
+            cur.execute(
+                """
+                DELETE FROM messages
+                WHERE user_id=?
+                  AND id NOT IN (
+                    SELECT id FROM messages WHERE user_id=? ORDER BY ts DESC LIMIT ?
+                  )
+                """,
+                (uid, uid, int(keep_messages)),
+            )
+            self.conn.commit()
+
+    @staticmethod
+    def redact(text: str) -> str:
+        """Best-effort redaction to avoid storing secrets in memory."""
+        t = (text or "")
+        # Discord tokens (very rough heuristic)
+        t = re.sub(r"[MN][A-Za-z\d_-]{20,}\.[A-Za-z\d_-]{6,}\.[A-Za-z\d_-]{20,}", "[REDACTED_TOKEN]", t)
+        # Common API key shapes
+        t = re.sub(r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*\S+", r"\1=[REDACTED]", t)
+        return t
 
     # -------------------------
     # Facts
@@ -140,25 +194,27 @@ class SQLiteMemory:
         if not key or not value:
             return
 
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO facts(user_id, key, value, confidence, updated_ts)
-            VALUES(?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, key) DO UPDATE SET
-              value=excluded.value,
-              confidence=excluded.confidence,
-              updated_ts=excluded.updated_ts
-            """,
-            (uid, key, value, confidence, _now_ts()),
-        )
-        self.conn.commit()
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO facts(user_id, key, value, confidence, updated_ts)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, key) DO UPDATE SET
+                  value=excluded.value,
+                  confidence=excluded.confidence,
+                  updated_ts=excluded.updated_ts
+                """,
+                (uid, key, value, confidence, _now_ts()),
+            )
+            self.conn.commit()
 
     def get_facts(self, user_id: int) -> Dict[str, str]:
         uid = str(user_id)
-        cur = self.conn.cursor()
-        cur.execute("SELECT key, value FROM facts WHERE user_id=? ORDER BY updated_ts DESC", (uid,))
-        return {row["key"]: row["value"] for row in cur.fetchall()}
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT key, value FROM facts WHERE user_id=? ORDER BY updated_ts DESC", (uid,))
+            return {row["key"]: row["value"] for row in cur.fetchall()}
 
     def facts_as_prompt(self, user_id: int) -> str:
         facts = self.get_facts(user_id)
@@ -207,21 +263,23 @@ class SQLiteMemory:
         importance = float(_clamp(importance, 0.0, 1.0))
         ts = int(ts or _now_ts())
 
-        cur = self.conn.cursor()
-        cur.execute(
-            "INSERT INTO episodes(user_id, ts, text, tags, importance) VALUES(?, ?, ?, ?, ?)",
-            (uid, ts, text, tags_str, importance),
-        )
-        self.conn.commit()
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO episodes(user_id, ts, text, tags, importance) VALUES(?, ?, ?, ?, ?)",
+                (uid, ts, text, tags_str, importance),
+            )
+            self.conn.commit()
 
     def _fetch_candidate_episodes(self, user_id: int, limit: int = 120) -> List[Episode]:
         uid = str(user_id)
-        cur = self.conn.cursor()
-        cur.execute(
-            "SELECT id, user_id, ts, text, tags, importance FROM episodes WHERE user_id=? ORDER BY ts DESC LIMIT ?",
-            (uid, int(limit)),
-        )
-        rows = cur.fetchall()
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT id, user_id, ts, text, tags, importance FROM episodes WHERE user_id=? ORDER BY ts DESC LIMIT ?",
+                (uid, int(limit)),
+            )
+            rows = cur.fetchall()
         return [
             Episode(
                 id=int(row["id"]),
@@ -261,7 +319,20 @@ class SQLiteMemory:
             scored.append((score, ep))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [ep for _, ep in scored[: int(limit)]]
+        picked = [ep for _, ep in scored[: int(limit)]]
+
+        # Track usage so frequently recalled episodes become more salient over time.
+        if picked:
+            with self._lock:
+                cur = self.conn.cursor()
+                for ep in picked:
+                    cur.execute(
+                        "UPDATE episodes SET times_used = times_used + 1, last_used_ts = ? WHERE id = ?",
+                        (_now_ts(), int(ep.id)),
+                    )
+                self.conn.commit()
+
+        return picked
 
     def episodes_as_prompt(self, episodes: List[Episode]) -> str:
         if not episodes:
@@ -280,31 +351,33 @@ class SQLiteMemory:
     def add_message(self, user_id: int, role: str, content: str, ts: Optional[int] = None) -> None:
         uid = str(user_id)
         role = (role or "").strip().lower()
-        content = (content or "").strip()
+        content = self.redact((content or "").strip())
         if role not in {"user", "assistant", "system"}:
             role = "user"
         if not content:
             return
 
         ts = int(ts or _now_ts())
-        cur = self.conn.cursor()
-        cur.execute(
-            "INSERT INTO messages(user_id, ts, role, content) VALUES(?, ?, ?, ?)",
-            (uid, ts, role, content),
-        )
-        self.conn.commit()
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO messages(user_id, ts, role, content) VALUES(?, ?, ?, ?)",
+                (uid, ts, role, content),
+            )
+            self.conn.commit()
 
         self._msg_counter[uid] = self._msg_counter.get(uid, 0) + 1
 
     def get_recent_messages(self, user_id: int, limit: int = 12) -> List[Dict[str, str]]:
         uid = str(user_id)
-        cur = self.conn.cursor()
-        cur.execute(
-            "SELECT role, content FROM messages WHERE user_id=? ORDER BY ts DESC LIMIT ?",
-            (uid, int(limit)),
-        )
-        rows = cur.fetchall()
-        return [{"role": str(r["role"]), "content": str(r["content"])} for r in rows][::-1]
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT role, content FROM messages WHERE user_id=? ORDER BY ts DESC LIMIT ?",
+                (uid, int(limit)),
+            )
+            rows = cur.fetchall()
+            return [{"role": str(r["role"]), "content": str(r["content"])} for r in rows][::-1]
 
     # -------------------------
     # LLM extraction (optional)
@@ -386,6 +459,12 @@ class SQLiteMemory:
                     imp = 0.5
 
                 self.add_episode(user_id, text=text, tags=tags, importance=imp)
+
+        # Keep the DB bounded.
+        try:
+            self.prune(user_id)
+        except Exception:
+            pass
 
     # -------------------------
     # Prompt injection
