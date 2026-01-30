@@ -58,9 +58,6 @@ def _tts_unavailable_message() -> str:
     # Keep this short; the real error prints to console.
     hint = (
         "TTS isn’t available right now (Coqui failed to import).\n"
-        "If you’re on Python 3.13, Coqui TTS may not be compatible yet—"
-        "try Python 3.10/3.11 in a fresh venv.\n"
-        "You can still use the bot normally without voice."
     )
     return hint
 
