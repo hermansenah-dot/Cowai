@@ -1,8 +1,10 @@
 ## Cowai (Discord AI Bot)
 
-<img src="Maise.png" alt="Maise" width="50%" />
+<img align="right" src="Maise.png" alt="Maise" width="320" />
 
 A Discord bot that chats via a local Ollama model, supports per-user memory + mood drift, and includes a small command system (reminders + optional voice/TTS).
+
+<br clear="right" />
 
 ### Features
 - Allowed-channel gate (only replies in `ALLOWED_CHANNEL_IDS`).
