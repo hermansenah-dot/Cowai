@@ -139,9 +139,6 @@ def log(message: str) -> None:
 # Prevent spamming “ready” messages on reconnects.
 READY_ANNOUNCED = False
 
-# Prevent repeated coqui-TTS warmup on reconnects.
-COQUI_WARMED_UP = False
-
 
 # =========================
 # Utilities: message splitting
@@ -259,42 +256,27 @@ async def on_ready() -> None:
     We:
     - print an info line
     - start the reminder loop
-    - announce readiness in the console (once per process)
+    - announce readiness in allowed channels (once per process)
     """
     global READY_ANNOUNCED
-    global COQUI_WARMED_UP
 
     log(f"Logged in as {client.user} (ID: {client.user.id})")
 
     # Start background reminder scheduler
     asyncio.create_task(reminder_loop(client, store))
 
-    # Optional: warm up coqui-TTS once so the first voice line is fast.
-    if not COQUI_WARMED_UP:
-        COQUI_WARMED_UP = True
-
-        async def _coqui_warmup() -> None:
-            log("[Voice] coqui-TTS warmup starting...")
-            try:
-                from tts_coqui import warmup_tts  # lazy / optional dependency
-            except Exception as e:
-                log(f"[Voice] coqui-TTS warmup skipped (import failed): {e}")
-                return
-            try:
-                await warmup_tts()
-                log("[Voice] coqui-TTS warmup complete.")
-            except Exception as e:
-                log(f"[Voice] coqui-TTS warmup failed: {e}")
-
-        asyncio.create_task(_coqui_warmup())
-
     # Announce readiness only once per process (avoid reconnect spam)
     if READY_ANNOUNCED:
         return
     READY_ANNOUNCED = True
 
-    # Console-only readiness confirmation.
-    log("✅ I’m online.")
+    ready_msg = "✅ I’m online."
+    for ch_id in ALLOWED_CHANNEL_IDS:
+        try:
+            channel = client.get_channel(ch_id) or await client.fetch_channel(ch_id)
+            await channel.send(ready_msg)
+        except Exception as e:
+            log(f"Ready message failed for channel {ch_id}: {e}")
 
 
 @client.event
