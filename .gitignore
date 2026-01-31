@@ -8,7 +8,11 @@ venv/
 
 # Ignore config.py to prevent committing secrets
 config.py
+memory.db
 
 # Ignore logs folder and all its contents
 logs/
 memory/
+
+# Ignore scratch/test file in personality module
+personality/test
