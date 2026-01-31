@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -22,6 +23,120 @@ from typing import Optional
 import discord
 import pytz
 import uptime
+
+
+# =========================
+# Recent-context + burst buffering (human-like multi-message turns)
+# =========================
+
+RECENT_CONTEXT_LIMIT = 12
+
+BURST_WINDOW_S = 2.5     # wait this long for more messages from same user in same channel
+BURST_MAX_LINES = 6      # stop buffering after this many messages
+BURST_MAX_CHARS = 900    # stop buffering after this many characters
+
+# key = (channel_id, user_id)
+_BURST: dict[tuple[int, int], dict] = {}
+_BURST_LOCKS = defaultdict(asyncio.Lock)
+
+async def build_recent_context(message: discord.Message, limit: int = RECENT_CONTEXT_LIMIT) -> list[dict]:
+    """
+    Pull recent channel history as additional context.
+    - Skips bots and commands.
+    - Skips messages by the SAME author as `message` to avoid duplicating burst parts.
+    - Labels each line with speaker name (helps in busy channels).
+    Returns: list of {role, content} (oldest -> newest).
+    """
+    ctx: list[dict] = []
+    try:
+        async for m in message.channel.history(limit=limit, before=message):
+            if m.author.bot:
+                continue
+            if m.author.id == message.author.id:
+                continue
+            content = (m.content or "").strip()
+            if not content:
+                continue
+            if content.startswith("!"):
+                continue
+            ctx.append({"role": "user", "content": f"{m.author.display_name}: {content}"})
+        ctx.reverse()
+    except Exception:
+        # If history fetching fails (permissions), just skip.
+        return []
+    return ctx
+
+async def _finalize_burst(key: tuple[int, int]) -> tuple[discord.Message, str] | None:
+    async with _BURST_LOCKS[key]:
+        state = _BURST.pop(key, None)
+        if not state:
+            return None
+        msg: discord.Message = state["last_message"]
+        combined = "\n".join(state["lines"]).strip()
+        if len(combined) > BURST_MAX_CHARS:
+            combined = combined[:BURST_MAX_CHARS].strip()
+        return msg, combined
+
+async def _burst_worker(key: tuple[int, int]) -> None:
+    """Debounce worker: waits for the user to stop sending messages, then replies once."""
+    while True:
+        async with _BURST_LOCKS[key]:
+            state = _BURST.get(key)
+            if not state:
+                return
+            ev: asyncio.Event = state["event"]
+            ev.clear()
+
+            # Safety caps: finalize early
+            combined_now = "\n".join(state["lines"]).strip()
+            if len(state["lines"]) >= BURST_MAX_LINES or len(combined_now) >= BURST_MAX_CHARS:
+                break
+
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=BURST_WINDOW_S)
+            continue  # got another message; keep waiting
+        except asyncio.TimeoutError:
+            break  # burst ended
+
+    finalized = await _finalize_burst(key)
+    if not finalized:
+        return
+    msg, combined_text = finalized
+    if not combined_text:
+        return
+    await handle_ai_conversation(msg, combined_text, raw_content=combined_text)
+
+async def enqueue_burst_message(message: discord.Message, user_text: str) -> None:
+    """
+    Add a message to the user's burst buffer and ensure a worker is running.
+    The worker will send ONE combined reply after the burst ends.
+    """
+    key = (message.channel.id, message.author.id)
+    async with _BURST_LOCKS[key]:
+        state = _BURST.get(key)
+        if state is None:
+            state = {
+                "lines": [],
+                "last_message": message,
+                "event": asyncio.Event(),
+                "task": None,
+            }
+            _BURST[key] = state
+
+        # Add this line
+        t = (user_text or "").strip()
+        if t:
+            state["lines"].append(t)
+        state["last_message"] = message
+
+        # Wake the worker
+        state["event"].set()
+
+        # Start worker if needed
+        task = state.get("task")
+        if task is None or task.done():
+            state["task"] = asyncio.create_task(_burst_worker(key))
+
 
 from ai import ask_llama
 from config import DISCORD_TOKEN, ALLOWED_CHANNEL_IDS
@@ -31,6 +146,7 @@ from personality.memory_short import get_short_memory
 from reminders import ReminderStore, reminder_loop
 from triggers import analyze_input
 from trust import trust
+import humanize
 
 # Centralized command router
 from commands import handle_commands, maybe_auto_voice_reply
@@ -324,52 +440,10 @@ async def on_ready() -> None:
         return
     READY_ANNOUNCED = True
 
-@client.event
-async def on_message(message: discord.Message) -> None:
-    """
-    Main message handler.
 
-    Order:
-    1) Ignore self / empty messages
-    2) Enforce allowed channels (return early)
-    3) Route commands to commands.py (single source of truth)
-    4) Otherwise: normal AI chat
-    """
-    # Ignore messages from the bot itself
-    if message.author == client.user:
-        return
 
-    content = (message.content or "").strip()
-    if not content:
-        return
-
-    # Channel restriction (hard gate)
-    if message.channel.id not in ALLOWED_CHANNEL_IDS:
-        return
-
-    # -------------------------
-    # 1) Commands
-    # -------------------------
-    # All command handling lives in commands.py.
-    if content.startswith("!"):
-        handled = await handle_commands(
-            message,
-            content,
-            store=store,
-            default_tz=DEFAULT_TZ,
-            LongMemory=Long_Term_Memory,
-        )
-        if handled:
-            return
-
-    # -------------------------
-    # 2) AI conversation
-    # -------------------------
-    # Remove bot mention (common when users ping the bot)
-    user_text = content.replace(f"<@{client.user.id}>", "").strip()
-    if not user_text:
-        return
-
+async def handle_ai_conversation(message: discord.Message, user_text: str, raw_content: str = "") -> None:
+    """Run the normal AI conversation logic for a (possibly combined) user_text."""
     username = message.author.display_name
     user_id = message.author.id
 
@@ -422,8 +496,29 @@ async def on_message(message: discord.Message) -> None:
 
         mem_block = (long_memory.as_prompt(user_text) or "").strip()
         extras: list[str] = []
+
+        # Trust (per-user)
         if trust_block:
             extras.append(trust_block)
+
+        # Build a style hint from trust + emotion so the bot feels more human in conversation.
+        try:
+            m = emotion.metrics()
+            relax = float(getattr(tstyle, "relax", 0.40)) if tstyle is not None else 0.40
+            style = humanize.Style(
+                relax=relax,
+                mood_label=emotion.label(),
+                valence=float(m.get("valence", 0.0)),
+                arousal=float(m.get("arousal", 0.0)),
+                dominance=float(m.get("dominance", 0.0)),
+            )
+        except Exception:
+            style = humanize.Style(relax=0.40, mood_label=emotion.label())
+
+        # Conversation rules (appended to system prompt via memory_short extras)
+        extras.append(humanize.system_style_block(style))
+
+        # Long-term memory block
         if mem_block:
             extras.append(mem_block)
 
@@ -443,7 +538,10 @@ async def on_message(message: discord.Message) -> None:
         short_memory.add("user", user_text)
 
         # Build chat messages for the LLM
-        messages = short_memory.get_messages()
+        base_messages = short_memory.get_messages()
+        recent_ctx = await build_recent_context(message, limit=RECENT_CONTEXT_LIMIT)
+        # Inject recent channel context after the system prompt
+        messages = [base_messages[0], *recent_ctx, *base_messages[1:]]
 
         # ask_llama is synchronous; run it in a thread so Discord doesn't lag.
         async with message.channel.typing():
@@ -451,6 +549,12 @@ async def on_message(message: discord.Message) -> None:
 
         # Censor banned words in the AI reply before sending
         reply = filter_banned_words(reply)
+
+        # Add a human-like conversational layer (listening line + occasional single follow-up)
+        try:
+            reply = humanize.apply_human_layer(reply, user_text, style)
+        except Exception:
+            pass
 
         # Store assistant reply in short-term memory
         short_memory.add("assistant", reply)
@@ -490,6 +594,58 @@ async def on_message(message: discord.Message) -> None:
     except Exception as e:
         log(f"Bot error: {e}")
         await message.channel.send("There is an issue with my AI.")
+
+
+@client.event
+async def on_message(message: discord.Message) -> None:
+    """
+    Main message handler.
+
+    Order:
+    1) Ignore self / empty messages
+    2) Enforce allowed channels (return early)
+    3) Route commands to commands.py (single source of truth)
+    4) Otherwise: normal AI chat
+    """
+    # Ignore messages from the bot itself
+    if message.author == client.user:
+        return
+
+    content = (message.content or "").strip()
+    if not content:
+        return
+
+    # Channel restriction (hard gate)
+    if message.channel.id not in ALLOWED_CHANNEL_IDS:
+        return
+
+    # -------------------------
+    # 1) Commands
+    # -------------------------
+    # All command handling lives in commands.py.
+    if content.startswith("!"):
+        handled = await handle_commands(
+            message,
+            content,
+            store=store,
+            default_tz=DEFAULT_TZ,
+            LongMemory=Long_Term_Memory,
+        )
+        if handled:
+            return
+
+    # -------------------------
+    # 2) AI conversation
+    # -------------------------
+    # Remove bot mention (common when users ping the bot)
+    user_text = content.replace(f"<@{client.user.id}>", "").strip()
+    if not user_text:
+        return
+
+    # Buffer rapid multi-message bursts into a single combined reply.
+    # The worker will call handle_ai_conversation() once the user stops sending messages.
+    await enqueue_burst_message(message, user_text)
+    return
 
 
 # =========================
