@@ -8,6 +8,90 @@ from typing import Any, Dict, List, Optional
 from memory_sqlite import SQLiteMemory
 
 
+def _first_meaningful_word(value: str) -> str:
+    """Return a single 'keyword' token from a preference phrase.
+
+    One-word mode, but tries to keep the *head* noun when the phrase is a compound:
+
+      - "tea tho" -> "tea"
+      - "the coffee" -> "coffee"
+      - "video games" -> "games"     (head noun / last meaningful token)
+      - "dark chocolate" -> "chocolate"
+      - "cats and dogs" -> "cats"    (takes first chunk before a connector)
+      - "and hate" -> ""             (filtered out)
+    """
+    if not value:
+        return ""
+
+    # Normalize punctuation to spaces, keep apostrophes inside words
+    v = re.sub(r"[\n\t\r]+", " ", value).strip().lower()
+    # Note: keep both straight quotes and curly quotes in the strip set.
+    v = re.sub(r'[.,!?;:()\[\]{}<>"“”‘’]+', " ", v)
+    v = re.sub(r"\s+", " ", v).strip()
+    if not v:
+        return ""
+
+    leading_stop = {
+        "a", "an", "the", "some", "any", "my", "your", "our", "their", "his", "her",
+        "and", "or", "but",
+        "to", "of", "for", "in", "on", "at", "with",
+    }
+
+    # Tokens that commonly indicate the user is adding commentary, not part of the thing they like/dislike
+    clause_breakers = {
+        "and", "or", "but", "&",
+        "tho", "though", "however",
+        "because", "since", "cuz",
+        "unless", "until", "while", "when",
+    }
+
+    trailing_fillers = {
+        "tho", "though", "lol", "lmao", "rofl", "tbh", "btw", "rn", "ngl", "idk",
+        "pls", "please", "fr", "lmk", "imo", "imho",
+        "too", "also", "anyway",
+    }
+
+    parts = [p for p in v.split(" ") if p]
+
+    # Drop leading stopwords
+    while parts and parts[0] in leading_stop:
+        parts.pop(0)
+
+    # If the phrase starts with a connector or verb fragment, bail
+    if not parts:
+        return ""
+
+    # Cut at the first clause breaker that appears after the first token
+    for i, tok in enumerate(parts[1:], start=1):
+        if tok in clause_breakers:
+            parts = parts[:i]
+            break
+
+    # Drop trailing filler tokens (e.g., "tea tho", "coffee lol")
+    while parts and parts[-1] in trailing_fillers:
+        parts.pop()
+
+    # Drop trailing stopwords just in case
+    while parts and parts[-1] in leading_stop:
+        parts.pop()
+
+    if not parts:
+        return ""
+
+    # Pick the head noun (last meaningful token) for compounds like "video games"
+    token = parts[-1].strip("'")
+
+    # Reject tokens that are obviously not a preference target
+    if token in {"like", "love", "hate", "dislike"}:
+        return ""
+    if token in leading_stop or token in clause_breakers or token in trailing_fillers:
+        return ""
+    if len(token) < 2:
+        return ""
+
+    return token
+
+
 # Store per-user JSON snapshots here (kept for backwards compatibility/debugging).
 # project_root/memory/users/<user_id>.json
 BASE_DIR = Path("memory") / "users"
@@ -225,10 +309,77 @@ class Long_Term_Memory:
         return False
 
     def _extract_likes(self, text: str) -> bool:
-        t = text.lower()
-        if "i like" not in t:
+        t = (text or "").strip()
+        tl = t.lower()
+
+        # Block meta questions like: "Would you like to know what I love and hate?"
+        if "?" in t and (_META_PREFERENCE_QUESTION_RE.search(t) or _LOVE_HATE_PAIR_RE.search(tl)):
             return False
-        value = text.split("i like", 1)[1].strip(" .!").lower()
+
+        # One-off feedback like "I liked that" should not become long-term "likes".
+        # (If the user explicitly signals durable intent, the vague-case resolver below can still store it.)
+        if self._is_one_off_feedback(tl):
+            return False
+
+        # Detect common preference statements (present tense), allowing up to 3 filler words
+        # between "I" and the preference verb (e.g., "I really fucking love coffee").
+        patterns = [
+            r"\bi\s+(?P<pre>(?:[\w']+\s+){0,3})?like\s+(?P<val>.+)$",
+            r"\bi\s+(?P<pre>(?:[\w']+\s+){0,3})?love\s+(?P<val>.+)$",
+            r"\bi\s+(?P<pre>(?:[\w']+\s+){0,3})?enjoy\s+(?P<val>.+)$",
+            r"\bi\s+(?P<pre>(?:[\w']+\s+){0,3})?prefer\s+(?P<val>.+)$",
+            r"\bi(?:'|\s+a)m\s+into\s+(?P<val>.+)$",
+            r"\bi\s+am\s+into\s+(?P<val>.+)$",
+            r"\bmy\s+favou?rite\b[^\n]{0,32}\b(?:is|are)\s+(?P<val>.+)$",
+        ]
+
+        m = None
+        for p in patterns:
+            m = re.search(p, t, re.IGNORECASE)
+            if m:
+                break
+        if not m:
+            return False
+
+        # If the user said something like "I don't really like X", don't store it as a like.
+        pre = (m.groupdict().get("pre") or "").lower()
+        if re.search(r"\b(don't|do\s+not|didn't|did\s+not|can't|cannot|not|never)\b", pre):
+            return False
+
+        value = (m.group("val") or "").strip().strip(" .!?:;\n\t").lower()
+        if not value:
+            return False
+
+        # Reject connective-only fragments like "and hate" / "or dislike"
+        if _CONNECTIVE_ONLY_VALUE_RE.match(value):
+            return False
+
+        # Reject values that start with a connective + a preference verb (usually indicates meta phrasing)
+        if re.match(r"^(and|or)\s+(hate|hated|dislike|disliked|love|loved|like|liked|enjoy|enjoyed|prefer|preferred)\b", value):
+            return False
+
+        # Reject vague values unless the user signals durable intent, then resolve from context.
+        if _VAGUE_VALUE_RE.match(value):
+            if not self._has_durable_intent(tl):
+                return False
+            resolved = self._resolve_referent_from_context(prefer_role="assistant", window=10)
+            if not resolved:
+                return False
+            value = resolved
+
+        # Avoid saving very session-specific likes unless the user explicitly says it's durable.
+        # Example: "I like this answer" is usually feedback, not a stable preference.
+        if not self._has_durable_intent(tl):
+            if re.search(r"\b(this|that)\s+(answer|response|message|idea|suggestion|one)\b", value, re.IGNORECASE):
+                return False
+        # Store only one word (keyword) for long-term memory
+        value = _first_meaningful_word(value)
+        if not value:
+            return False
+
+        # Avoid storing junk / ultra-short values
+        if len(value) < 2:
+            return False
         likes = _list_from_any(self.data.get("likes"))
         if value and value not in likes:
             likes.append(value)
@@ -237,21 +388,143 @@ class Long_Term_Memory:
         return False
 
     def _extract_dislikes(self, text: str) -> bool:
-        t = text.lower()
-        if "i dislike" in t:
-            value = text.split("i dislike", 1)[1]
-        elif "i hate" in t:
-            value = text.split("i hate", 1)[1]
-        else:
+        t = (text or "").strip()
+        tl = t.lower()
+
+        # Block meta questions like: "Would you like to know what I love and hate?"
+        if "?" in t and (_META_PREFERENCE_QUESTION_RE.search(t) or _LOVE_HATE_PAIR_RE.search(tl)):
             return False
 
-        value = value.strip(" .!").lower()
+        # Capture negative preferences more broadly than just "i hate" / "i dislike".
+        # Supports:
+        # - "I hate X" / "I fucking hate X"
+        # - "I dislike X"
+        # - "I can't stand X"
+        # - "I don't like X" / "I do not like X"
+        patterns = [
+            r"\bi\s+(?P<pre>(?:[\w']+\s+){0,3})?(?:dislike|disliked|hate|hated|can't\s+stand|cannot\s+stand)\s+(?P<val>.+)$",
+            r"\bi\s+(?P<pre>(?:[\w']+\s+){0,3})?(?:don't|do\s+not|can't|cannot)\s+(?P<mid>(?:[\w']+\s+){0,3})?like\s+(?P<val>.+)$",
+        ]
+
+        m = None
+        used_pattern = None
+        for p in patterns:
+            m = re.search(p, t, re.IGNORECASE)
+            if m:
+                used_pattern = p
+                break
+        if not m:
+            return False
+
+        pre = (m.groupdict().get("pre") or "").lower()
+        mid = (m.groupdict().get("mid") or "").lower()
+
+        # If it's of the form "I don't hate X" / "I never hated X", ignore.
+        if used_pattern == patterns[0] and re.search(r"\b(don't|do\s+not|not|never)\b", pre):
+            return False
+
+        # For the "don't like" pattern, ensure it's actually negative (it is by construction),
+        # but if someone says "I don't really like..." that's still a dislike.
+        value = (m.group("val") or "").strip().strip(" .!?:;\n\t").lower()
+        if not value:
+            return False
+
+        # Reject connective-only fragments like "and love" / "or like"
+        if _CONNECTIVE_ONLY_VALUE_RE.match(value):
+            return False
+
+        # Reject vague values unless the user signals durable intent, then resolve from context.
+        if _VAGUE_VALUE_RE.match(value):
+            if not self._has_durable_intent(tl):
+                return False
+            resolved = self._resolve_referent_from_context(prefer_role="assistant", window=10)
+            if not resolved:
+                return False
+            value = resolved
+        # Store only one word (keyword) for long-term memory
+        value = _first_meaningful_word(value)
+        if not value:
+            return False
+
+        # Avoid storing junk / ultra-short values
+        if len(value) < 2:
+            return False
         dislikes = _list_from_any(self.data.get("dislikes"))
         if value and value not in dislikes:
             dislikes.append(value)
             self.data["dislikes"] = dislikes
             return True
         return False
+
+    # ------------------
+    # Helper gates (natural memory)
+    # ------------------
+
+    def _is_one_off_feedback(self, tl: str) -> bool:
+        """Return True for short-lived reactions that shouldn't become durable likes/dislikes."""
+        if not tl:
+            return False
+        # Past-tense reactions are usually feedback about the current convo item
+        if _ONE_OFF_FEEDBACK_RE.search(tl):
+            return True
+        # Generic praise without an object ("that was great") is not a stable preference
+        if re.search(r"\bthat\s+(was|is)\s+(nice|good|great|cool|awesome|amazing)\b", tl):
+            return True
+        return False
+
+    def _has_durable_intent(self, tl: str) -> bool:
+        """Return True when the user signals they want this remembered going forward."""
+        return bool(tl and _DURABLE_INTENT_RE.search(tl))
+
+    def _resolve_referent_from_context(self, prefer_role: str = "assistant", window: int = 10) -> Optional[str]:
+        """Resolve vague 'that/this/it' by looking at recent messages in SQLite."""
+        try:
+            uid = int(self.user_id)
+        except Exception:
+            return None
+
+        try:
+            msgs = _SQL.get_recent_messages(uid, limit=max(3, int(window)))
+        except Exception:
+            return None
+
+        if not msgs:
+            return None
+
+        # Prefer the latest message from prefer_role, else fall back to the latest non-empty message
+        content = ""
+        for m in reversed(msgs):
+            if (m.get("role") == prefer_role) and (m.get("content") or "").strip():
+                content = (m.get("content") or "").strip()
+                break
+        if not content:
+            for m in reversed(msgs):
+                if (m.get("content") or "").strip():
+                    content = (m.get("content") or "").strip()
+                    break
+        if not content:
+            return None
+
+        # Heuristic: last bullet/line is often the concrete suggestion/item the user is referring to
+        raw_lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+        bullet_lines = [ln.lstrip("-• \t").strip() for ln in raw_lines if ln.lstrip().startswith(("-", "•"))]
+        if bullet_lines:
+            candidate = bullet_lines[-1]
+        else:
+            # Fall back to last sentence-ish chunk
+            parts = re.split(r"(?<=[.!?])\s+", content)
+            parts = [p.strip() for p in parts if p.strip()]
+            candidate = parts[-1] if parts else content
+
+        candidate = candidate.strip(" \t\n\r""'`“”‘’.,!?:;()").lower()
+        if not candidate or len(candidate) < 3:
+            return None
+
+        # Avoid returning pure role markers or obvious template artifacts
+        if re.match(r"^(user|assistant|system)\s*:\s*$", candidate):
+            return None
+
+        return candidate
 
     def _set(self, key: str, value: Any) -> bool:
         if self.data.get(key) != value:
@@ -289,3 +562,39 @@ class Long_Term_Memory:
         if dislikes:
             parts.append("The user dislikes: " + ", ".join(dislikes) + ".")
         return " ".join(parts).strip()
+
+# Meta questions about preferences (not actual stated preferences), e.g.:
+# "Would you like to know what I love and hate?"
+_META_PREFERENCE_QUESTION_RE = re.compile(
+    r"\b(would you like to know|do you want to know|want to know|"
+    r"would you like me to tell you|should i tell you|can i tell you)\b",
+    re.IGNORECASE,
+)
+
+_LOVE_HATE_PAIR_RE = re.compile(
+    r"\bwhat\s+i\b.*\b(like|love|enjoy|prefer)\b.*\b(and|or)\b.*\b(hate|dislike|can't stand|cannot stand|don't like|do not like)\b",
+    re.IGNORECASE,
+)
+
+_CONNECTIVE_ONLY_VALUE_RE = re.compile(
+    r"^(and|or)\s+(hate|hated|dislike|disliked|love|loved|like|liked|enjoy|enjoyed|prefer|preferred)\b(?:\s+(it|this|that))?\s*$",
+    re.IGNORECASE,
+)
+
+
+# Vague referents that require context resolution + durable intent to store.
+_VAGUE_VALUE_RE = re.compile(r"^(?:that|this|it|this\s+one|that\s+one)\s*$", re.IGNORECASE)
+
+# Phrases that indicate the user wants this preference remembered for future chats.
+_DURABLE_INTENT_RE = re.compile(
+    r"\b(from now on|going forward|remember( this)?|note this|do that again|do this again|"
+    r"stick with that|stick with this|in the future|next time)\b",
+    re.IGNORECASE,
+)
+
+# One-off feedback/reactions that should not become long-term preferences.
+_ONE_OFF_FEEDBACK_RE = re.compile(
+    r"\b(i\s+(?:really\s+)?)?(liked|loved|enjoyed)\b\s+(that|this|it)\b|"
+    r"\b(that|this|it)\s+(was|is)\s+(nice|good|great|cool|awesome|amazing)\b",
+    re.IGNORECASE,
+)

@@ -25,7 +25,7 @@ import requests
 
 try:
     # Local file alongside this module
-    from persona import persona_with_emotion
+    from personality.persona import persona_with_emotion
 except Exception:  # pragma: no cover
     persona_with_emotion = None  # type: ignore[assignment]
 
@@ -69,6 +69,81 @@ def ensure_system_message(
 
 
 # -------------------------
+# Telemetry / prompt-leak sanitization
+# -------------------------
+#
+# If your app includes UI/telemetry headers in the prompt (timestamps, "APP", "mAIcé:",
+# valence/arousal, trust score, etc.), many models will echo that format and then
+# "continue the transcript". We defensively strip these lines from BOTH input messages
+# (before sending to Ollama) and from the model output.
+
+_TELEMETRY_LINE_RE = re.compile(
+    r"^\s*(?:\[\d{1,2}:\d{2}\]\s*)?(?:APP\b|mAIc\u00e9:|maic\u00e9:|mAIce:|maice:|"
+    r"valence=|arousal=|dominance=|trust\s+score|response\s+time:|response\s+length:|"
+    r"tone\s+matching\s+mode|style\s+tics:|conversation\s+style\s+rules:|"
+    r"user\s+trust\s+context:|current\s+emotional\s+state:|guidance:|core\s+qualities:|"
+    r"important\s+notes:|known\s+facts:|safety\s+rules:)\b",
+    re.IGNORECASE,
+)
+
+# Markers that indicate the model started printing an internal transcript/telemetry block.
+_TELEMETRY_TRUNCATE_MARKERS: tuple[str, ...] = (
+    "\nAPP\n",
+    "\nAPP\r\n",
+)
+
+
+def _strip_telemetry_lines(text: str) -> str:
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+    kept: List[str] = []
+    for ln in lines:
+        if _TELEMETRY_LINE_RE.search(ln):
+            continue
+        kept.append(ln)
+    # If we stripped everything (rare), fall back to original so we don't blank replies.
+    cleaned = "\n".join(kept).strip()
+    return cleaned if cleaned else text.strip()
+
+
+def _truncate_at_telemetry(text: str) -> str:
+    """Cut off anything after a telemetry/transcript marker if it appears."""
+    if not text:
+        return ""
+    cut = len(text)
+    for m in _TELEMETRY_TRUNCATE_MARKERS:
+        idx = text.find(m)
+        if idx != -1 and idx < cut:
+            cut = idx
+    return text[:cut].strip()
+
+
+def _sanitize_for_llm(text: str) -> str:
+    """Remove telemetry-like lines from text before sending to the model."""
+    return _strip_telemetry_lines(text)
+
+
+def _sanitize_from_llm(text: str) -> str:
+    """Remove telemetry-like blocks from the model output."""
+    return _strip_telemetry_lines(_truncate_at_telemetry(text))
+
+
+def sanitize_messages(messages: Sequence[Mapping[str, str]]) -> List[Dict[str, str]]:
+    """Strip telemetry from message contents to avoid prompt-format lock-in."""
+    sanitized: List[Dict[str, str]] = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+        if isinstance(role, str) and isinstance(content, str):
+            sanitized.append({"role": role, "content": _sanitize_for_llm(content)})
+        else:
+            sanitized.append(dict(m))
+    return sanitized
+
+
+# -------------------------
 # Defaults
 # -------------------------
 
@@ -90,6 +165,24 @@ DEFAULT_STOP_TOKENS: tuple[str, ...] = (
     "<|im_end|>",
     "<|im_end",  # partial
     "</s>",
+    # Common role markers that cause the model to continue as the other side
+    "\nUser:",
+    "\nuser:",
+    "\nAssistant:",
+    "\nassistant:",
+    "\nSystem:",
+    "\nsystem:",
+    "\n### User",
+    "\n### Assistant",
+    # Llama-style header tokens (may appear depending on template)
+    "<|start_header_id|>user",
+    "<|start_header_id|>assistant",
+    # Telemetry / UI transcript markers (avoid the model continuing these)
+    "\nAPP",
+    "\nmAIc\u00e9:",
+    "\nmaic\u00e9:",
+    "\nmAIce:",
+    "\nmaice:",
 )
 
 # Precompiled cleanup patterns
@@ -149,11 +242,16 @@ class OllamaChatClient:
 
     def chat(self, messages: Sequence[Mapping[str, str]]) -> str:
         """Send role-based messages to Ollama and return a clean assistant reply."""
-        self._validate_messages(messages)
-
+        # Inject persona/system prompt first so it's included in validation + sanitization.
         if self.config.inject_persona:
             system_prompt = build_system_prompt(self.config.emotion_description)
             messages = ensure_system_message(messages, system_prompt)
+
+        # Strip any UI/telemetry blocks accidentally included in message content.
+        messages = sanitize_messages(messages)
+
+        # Validate after we may have inserted/sanitized messages.
+        self._validate_messages(messages)
 
         payload: Dict[str, Any] = {
             "model": self.config.model,
@@ -178,7 +276,9 @@ class OllamaChatClient:
 
         data = resp.json()
         reply = data.get("message", {}).get("content", "") or ""
-        return clean_special_tokens(reply, stop_tokens=self.config.stop_tokens)
+        # Clean special tokens, then strip any leaked telemetry/transcript blocks.
+        cleaned = clean_special_tokens(reply, stop_tokens=self.config.stop_tokens)
+        return _sanitize_from_llm(cleaned)
 
     @staticmethod
     def _validate_messages(messages: Sequence[Mapping[str, str]]) -> None:
