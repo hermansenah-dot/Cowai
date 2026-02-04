@@ -168,13 +168,13 @@ def listening_line(user_text: str, style: Style) -> str:
 def system_style_block(style: Style) -> str:
     """Short, high-leverage system guidance appended via memory_short extras."""
     if style.relax >= 0.70:
-        tone = "Relaxed, casual. One emoji max per reply if it fits."
+        tone = "Relaxed, casual, chaotic energy allowed."
     elif style.relax >= 0.35:
-        tone = "Friendly but direct. Skip emojis unless user uses them."
+        tone = "Friendly but direct."
     else:
-        tone = "Professional and neutral. No emojis."
+        tone = "Professional and neutral."
 
-    return f"Reply style: {tone} Let thoughts flow naturally."
+    return f"Reply style: {tone} Match the user's energy - short and snappy for casual, unhinged rants when things get exciting."
 
 
 

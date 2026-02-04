@@ -140,22 +140,20 @@ async def send_split_message(
     channel: discord.abc.Messageable,
     text: str,
     *,
-    max_len: int = 750,
-    max_parts: int = 8,
-    delay: float = 0.25,
+    max_len: int = 2000,
+    max_parts: int = 1,
+    delay: float = 0.0,
 ) -> None:
-    """Send `text` as multiple Discord messages using split_for_discord."""
-    parts = split_for_discord(
-        text,
-        max_len=max_len,
-        max_parts=max_parts,
-        max_sentences_per_chunk=5,
-    )
+    """Send `text` as a single Discord message (truncates if over 2000 chars)."""
+    text = text.strip()
+    if not text:
+        return
     
-    for i, chunk in enumerate(parts):
-        await channel.send(chunk)
-        if delay and i != len(parts) - 1:
-            await asyncio.sleep(delay)
+    # Truncate to Discord's limit if needed
+    if len(text) > max_len:
+        text = text[:max_len - 3] + "..."
+    
+    await channel.send(text)
 
 
 # =========================
