@@ -4,7 +4,7 @@
 
 A Discord bot that chats via a local Ollama model, supports per-user memory + mood drift, and includes a small command system (reminders + optional voice/TTS + trust).
 
-> Note: A big part of this project is "vibe coded" - expect rough edges.
+> Note: A big part of this project is "vibe coded" - expect rough edges. If in the future there will be personal data of any kind in the program, it will not be vibe coded for security reasons.
 
 <br clear="right" />
 
@@ -23,7 +23,7 @@ A Discord bot that chats via a local Ollama model, supports per-user memory + mo
 - Humanization layer adds natural listening lines and conversation flow (`humanize.py`).
 - Commands (single source of truth in `commands.py`):
   - `!reminder ...` (creates reminders only when explicitly requested)
-  - `!tts ...` (optional Coqui TTS)
+  - `!tts ...` (Edge TTS voice synthesis)
   - `!voice on/off/status` (optional auto-voice replies)
   - `!uptime` (connection uptime / reconnect tracking)
   - `!trust`, `!trustwhy` (view trust)
@@ -41,7 +41,7 @@ humanize.py         # Conversational style layer
 memory_sqlite.py    # SQLite storage for memory
 reminders.py        # Reminder system
 triggers.py         # Mood delta analysis
-tts_coqui.py        # Optional Coqui TTS integration
+tts_edge.py         # Edge TTS integration (Microsoft cloud voices)
 
 utils/              # Shared utilities
 ├── logging.py      # Timestamped logging
@@ -58,9 +58,10 @@ tests/              # Unit tests
 ```
 
 ### Requirements
-- Python 3.11+ (3.13 works but Coqui TTS may have issues).
+- Python 3.11+ (3.13 recommended).
 - Ollama running locally at `http://localhost:11434`.
 - FFmpeg installed if you use voice/TTS in Discord.
+- Internet connection for Edge TTS (uses Microsoft cloud voices).
 
 ### Setup
 1. Create a virtual environment and install dependencies:
@@ -94,9 +95,10 @@ python -m pytest tests/ -v
 ```
 
 ### Notes
-- `logs/`, `memory/`, and `tts_tmp/` are ignored by git (runtime data).
+- `logs/`, `memory/`, `tts_tmp/`, and `finetuning/` are ignored by git (runtime data).
 - Trust persistence lives in `memory/trust.db`.
-- If `!tts` says Coqui failed to import, try Python 3.11 in a fresh venv.
+- Edge TTS requires an internet connection (uses Microsoft's cloud voices).
+- Voice can be changed by editing `VOICE` in `tts_edge.py` (run `edge-tts --list-voices` to see options).
 
 ### Memory tips
 - To reset memory for everyone: delete `memory/memory.db` (and optionally `memory/users/`).
