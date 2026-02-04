@@ -16,18 +16,11 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 
-
-def _now_ts() -> int:
-    return int(time.time())
-
-
-def _clampf(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, float(x)))
+from utils.helpers import clamp, now_ts
 
 
 @dataclass(frozen=True)
@@ -87,17 +80,17 @@ class TrustStore:
             row = cur.fetchone()
 
         if not row:
-            return float(_clampf(default, 0.0, 1.0))
+            return float(clamp(default, 0.0, 1.0))
 
         try:
-            return float(_clampf(row["score"], 0.0, 1.0))
+            return float(clamp(row["score"], 0.0, 1.0))
         except Exception:
-            return float(_clampf(default, 0.0, 1.0))
+            return float(clamp(default, 0.0, 1.0))
 
     def set_score(self, user_id: int, score: float, *, reason: str = "manual set") -> float:
         uid = str(int(user_id))
-        score = float(_clampf(score, 0.0, 1.0))
-        now = _now_ts()
+        score = float(clamp(score, 0.0, 1.0))
+        now = now_ts()
 
         with self._lock:
             cur = self.conn.cursor()
@@ -122,9 +115,9 @@ class TrustStore:
     def add(self, user_id: int, delta: float, *, reason: str) -> float:
         delta = float(delta)
         current = self.get_score(user_id)
-        new_score = float(_clampf(current + delta, 0.0, 1.0))
+        new_score = float(clamp(current + delta, 0.0, 1.0))
         uid = str(int(user_id))
-        now = _now_ts()
+        now = now_ts()
 
         with self._lock:
             cur = self.conn.cursor()
@@ -173,8 +166,8 @@ class TrustStore:
         mood_multiplier: [0.6..1.8] — scales how much messages affect the mood engine.
         """
         score = self.get_score(user_id)
-        relax = float(_clampf((score - 0.20) / 0.80, 0.0, 1.0))
-        mood_multiplier = float(_clampf(1.0 + (score - 0.50) * 1.2, 0.6, 1.8))
+        relax = float(clamp((score - 0.20) / 0.80, 0.0, 1.0))
+        mood_multiplier = float(clamp(1.0 + (score - 0.50) * 1.2, 0.6, 1.8))
         return TrustStyle(score=score, relax=relax, mood_multiplier=mood_multiplier)
 
     def prompt_block(self, user_id: int) -> str:

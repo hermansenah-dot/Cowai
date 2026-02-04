@@ -48,7 +48,13 @@ reminders.py        # Reminder system
 triggers.py         # Mood delta analysis
 tts_edge.py         # Edge TTS integration (Microsoft cloud voices)
 
+core/               # Extracted bot logic
+├── conversation.py # AI conversation handler, NLP hints, mood processing
+├── context.py      # Discord channel context building, message sending
+└── loops.py        # Background tasks (random engagement loop)
+
 utils/              # Shared utilities
+├── helpers.py      # Common functions (clamp, now_ts, get_current_time)
 ├── logging.py      # Timestamped logging
 ├── text.py         # WordFilter, split_for_discord, chunk_text_for_tts
 └── burst.py        # BurstBuffer for multi-message handling

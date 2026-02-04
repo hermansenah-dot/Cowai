@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from utils.helpers import clamp, now_ts
+
 # Vector embeddings (lazy import to avoid startup cost if Ollama is down)
 _vector_module = None
 
@@ -40,10 +42,6 @@ def _get_vector_module():
     return _vector_module if _vector_module else None
 
 
-def _now_ts() -> int:
-    return int(time.time())
-
-
 def _norm_words(text: str) -> List[str]:
     words = re.findall(r"[a-zA-Z0-9']{2,}", text.lower())
     seen = set()
@@ -53,10 +51,6 @@ def _norm_words(text: str) -> List[str]:
             out.append(w)
             seen.add(w)
     return out
-
-
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
 
 
 @dataclass
@@ -205,7 +199,7 @@ class SQLiteMemory:
         uid = str(user_id)
         key = key.strip().lower()
         value = value.strip()
-        confidence = float(_clamp(confidence, 0.0, 1.0))
+        confidence = float(clamp(confidence, 0.0, 1.0))
 
         if not key or not value:
             return
@@ -221,7 +215,7 @@ class SQLiteMemory:
                   confidence=excluded.confidence,
                   updated_ts=excluded.updated_ts
                 """,
-                (uid, key, value, confidence, _now_ts()),
+                (uid, key, value, confidence, now_ts()),
             )
             self.conn.commit()
 
@@ -278,8 +272,8 @@ class SQLiteMemory:
             return
 
         tags_str = ", ".join([str(t).strip().lower() for t in tags if str(t).strip()])
-        importance = float(_clamp(importance, 0.0, 1.0))
-        ts = int(ts or _now_ts())
+        importance = float(clamp(importance, 0.0, 1.0))
+        ts = int(ts or now_ts())
 
         # Generate embedding if enabled
         embedding_blob: Optional[bytes] = None
@@ -330,7 +324,7 @@ class SQLiteMemory:
             return []
 
         candidates = self._fetch_candidate_episodes(user_id, limit=160)
-        now = _now_ts()
+        now = now_ts()
 
         scored: List[Tuple[float, Episode]] = []
         for ep in candidates:
@@ -341,7 +335,7 @@ class SQLiteMemory:
                 continue
 
             age_days = max(0.0, (now - ep.ts) / 86400.0)
-            recency = _clamp(1.0 - (age_days / 30.0), 0.0, 1.0)
+            recency = clamp(1.0 - (age_days / 30.0), 0.0, 1.0)
 
             score = (overlap * 2.0) + (ep.importance * 1.5) + (recency * 1.0)
             scored.append((score, ep))
@@ -356,7 +350,7 @@ class SQLiteMemory:
                 for ep in picked:
                     cur.execute(
                         "UPDATE episodes SET times_used = times_used + 1, last_used_ts = ? WHERE id = ?",
-                        (_now_ts(), int(ep.id)),
+                        (now_ts(), int(ep.id)),
                     )
                 self.conn.commit()
 
@@ -401,7 +395,7 @@ class SQLiteMemory:
             return self.retrieve_relevant(user_id, query, limit)
 
         uid = str(user_id)
-        now = _now_ts()
+        now = now_ts()
 
         # Fetch all episodes with embeddings for this user
         with self._lock:
@@ -447,7 +441,7 @@ class SQLiteMemory:
                 continue
 
             age_days = max(0.0, (now - int(row["ts"])) / 86400.0)
-            recency = _clamp(1.0 - (age_days / 30.0), 0.0, 1.0)
+            recency = clamp(1.0 - (age_days / 30.0), 0.0, 1.0)
 
             # Hybrid score: mostly similarity, some recency
             hybrid = (sim_score * (1 - recency_weight)) + (recency * recency_weight)
@@ -472,7 +466,7 @@ class SQLiteMemory:
                 for ep in picked:
                     cur.execute(
                         "UPDATE episodes SET times_used = times_used + 1, last_used_ts = ? WHERE id = ?",
-                        (_now_ts(), int(ep.id)),
+                        (now_ts(), int(ep.id)),
                     )
                 self.conn.commit()
 
@@ -501,7 +495,7 @@ class SQLiteMemory:
         if not content:
             return
 
-        ts = int(ts or _now_ts())
+        ts = int(ts or now_ts())
         with self._lock:
             cur = self.conn.cursor()
             cur.execute(

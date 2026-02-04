@@ -1,6 +1,6 @@
 from .persona import persona_with_emotion
 from emotion import emotion
-from tools import get_current_time
+from utils.helpers import get_current_time
 
 try:
     from config import EMOTION_ENABLED

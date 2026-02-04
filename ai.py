@@ -20,6 +20,8 @@ import re
 import json
 import requests
 
+from utils.helpers import clamp
+
 # -------------------------
 # Persona / system prompt
 # -------------------------
@@ -330,14 +332,6 @@ def _extract_first_json_object(text: str) -> Optional[str]:
     return None
 
 
-def _clamp(x: float, lo: float, hi: float) -> float:
-    try:
-        xf = float(x)
-    except Exception:
-        xf = 0.0
-    return max(lo, min(hi, xf))
-
-
 def _normalize_nlp_result(obj: Any) -> Dict[str, Any]:
     # Safe defaults
     out: Dict[str, Any] = {
@@ -370,8 +364,8 @@ def _normalize_nlp_result(obj: Any) -> Dict[str, Any]:
             label = "other"
         out["emotion"] = {
             "label": label,
-            "valence": _clamp(emo.get("valence", 0.0), -1.0, 1.0),
-            "arousal": _clamp(emo.get("arousal", 0.3), 0.0, 1.0),
+            "valence": clamp(emo.get("valence", 0.0), -1.0, 1.0),
+            "arousal": clamp(emo.get("arousal", 0.3), 0.0, 1.0),
         }
 
     needs = obj.get("needs", [])

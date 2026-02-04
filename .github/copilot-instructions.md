@@ -5,18 +5,23 @@
 This is a **Discord AI chatbot** ("Maicé") that uses a local Ollama LLM. Key data flows:
 
 ```
-Discord message → bot.py → burst buffer → ai.py (Ollama) → response filtering → Discord reply
-                    ↓                         ↑
-              commands.py              personality/persona.py
-                    ↓                         ↑
+Discord message → bot.py → burst buffer → core/conversation.py → ai.py (Ollama) → response filtering → Discord reply
+                    ↓                              ↑
+              commands.py                  personality/persona.py
+                    ↓                              ↑
          memory_sqlite.py ←→ emotion.py ←→ trust.py
 ```
 
 ### Core Components
-- **bot.py**: Entry point, Discord event handlers, channel gating (`ALLOWED_CHANNEL_IDS`), priority queue worker
+- **bot.py**: Entry point, Discord event handlers, channel gating (`ALLOWED_CHANNEL_IDS`), queue startup
+- **core/**: Extracted bot logic
+  - `conversation.py`: AI conversation handler, NLP hints, mood processing
+  - `context.py`: Discord channel context building, message sending
+  - `loops.py`: Background tasks (random engagement loop)
 - **ai.py**: Ollama `/api/chat` wrapper with telemetry sanitization and special token cleanup
 - **commands.py**: Single source of truth for `!` commands (`!reminder`, `!join`, `!disconnect`, `!tts`, `!voice`, `!trust`, `!uptime`)
 - **utils/**: Shared utilities package
+  - `helpers.py`: Common functions (`clamp()`, `now_ts()`, `get_current_time()`)
   - `logging.py`: Timestamped console/file logging
   - `text.py`: `WordFilter`, `split_for_discord()`, `chunk_text_for_tts()`
   - `burst.py`: `BurstBuffer` for multi-message buffering (0.3s window)
