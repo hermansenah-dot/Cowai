@@ -14,9 +14,13 @@ Notes:
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 import discord
+
+# Suppress noisy voice_recv logs
+logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
 
 # Local imports
 from ai import ask_llama
@@ -81,7 +85,14 @@ _TTS_READY = False
 intents = discord.Intents.default()
 intents.message_content = True
 
-client = discord.Client(intents=intents)
+# Use VoiceRecvClient for voice receive support
+try:
+    from discord.ext.voice_recv import VoiceRecvClient
+    client = discord.Client(intents=intents, voice_client_class=VoiceRecvClient)
+    log("[Bot] VoiceRecvClient enabled for STT support")
+except ImportError:
+    client = discord.Client(intents=intents)
+    log("[Bot] VoiceRecvClient not available, STT disabled")
 
 
 async def _burst_to_queue_handler(

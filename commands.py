@@ -35,6 +35,14 @@ from reminders import Reminder, ReminderStore
 from trust import trust
 from utils.text import chunk_text_for_tts, truncate_for_tts
 
+# Voice listening (STT)
+try:
+    from voice_listen import start_listening, stop_listening, is_listening
+    _STT_AVAILABLE = True
+except ImportError as e:
+    _STT_AVAILABLE = False
+    print(f"[Commands] STT not available: {e}")
+
 if TYPE_CHECKING:
     from pytz.tzinfo import BaseTzInfo
 
@@ -441,8 +449,8 @@ async def _handle_tts(message: discord.Message, content: str) -> bool:
     return True
 
 
-async def _handle_join(message: discord.Message) -> bool:
-    """Handle !join command - join user's voice channel."""
+async def _handle_join(message: discord.Message, LongMemory) -> bool:
+    """Handle !join command - join voice channel, start listening, enable voice replies."""
     if not message.author.voice or not message.author.voice.channel:
         await message.channel.send("You need to be in a voice channel first.")
         return True
@@ -454,6 +462,14 @@ async def _handle_join(message: discord.Message) -> bool:
         await message.channel.send("This command only works in a server.")
         return True
     
+    # Import VoiceRecvClient for STT support
+    VoiceRecvClient = None
+    if _STT_AVAILABLE:
+        try:
+            from discord.ext.voice_recv import VoiceRecvClient
+        except ImportError:
+            pass
+    
     try:
         vc = guild.voice_client
         if vc and vc.is_connected():
@@ -462,17 +478,53 @@ async def _handle_join(message: discord.Message) -> bool:
                 await message.channel.send(f"Moved to **{voice_channel.name}**")
             else:
                 await message.channel.send(f"Already in **{voice_channel.name}**")
+                return True
         else:
-            await voice_channel.connect()
+            # Connect with VoiceRecvClient if available for STT support
+            if VoiceRecvClient:
+                vc = await voice_channel.connect(cls=VoiceRecvClient)
+            else:
+                vc = await voice_channel.connect()
             await message.channel.send(f"Joined **{voice_channel.name}**")
+        
+        # Enable voice replies for this user
+        set_voice_enabled(message.author.id, True, LongMemory)
+        await message.channel.send("🔊 Voice replies: **ON**")
+        
+        # Start STT listening (only works with VoiceRecvClient)
+        if _STT_AVAILABLE and vc and hasattr(vc, 'listen'):
+            from core import handle_ai_conversation
+            
+            async def on_voice_transcription(member: discord.Member, text: str):
+                """Handle transcribed voice input."""
+                # Create a fake message-like object for the conversation handler
+                # We'll send to the text channel instead
+                await message.channel.send(f"🎤 **{member.display_name}**: {text}")
+                
+                # Create minimal message context for AI
+                class VoiceMessage:
+                    def __init__(self):
+                        self.author = member
+                        self.channel = message.channel
+                        self.guild = guild
+                        self.content = text
+                
+                await handle_ai_conversation(VoiceMessage(), text)
+            
+            success = await start_listening(vc, message.channel, on_voice_transcription)
+            if success:
+                await message.channel.send("🎤 Listening for voice...")
+            else:
+                await message.channel.send("⚠️ Voice listening not available (STT failed to start)")
+        
     except Exception as e:
         await message.channel.send(f"Failed to join: `{e}`")
     
     return True
 
 
-async def _handle_disconnect(message: discord.Message) -> bool:
-    """Handle !disconnect command - leave voice channel."""
+async def _handle_disconnect(message: discord.Message, LongMemory) -> bool:
+    """Handle !disconnect command - leave voice channel, stop listening, disable voice replies."""
     guild = message.guild
     
     if not guild:
@@ -482,8 +534,16 @@ async def _handle_disconnect(message: discord.Message) -> bool:
     vc = guild.voice_client
     if vc and vc.is_connected():
         channel_name = vc.channel.name
+        
+        # Stop STT listening first
+        if _STT_AVAILABLE:
+            await stop_listening(vc)
+        
+        # Disable voice replies for this user
+        set_voice_enabled(message.author.id, False, LongMemory)
+        
         await vc.disconnect()
-        await message.channel.send(f"Left **{channel_name}**")
+        await message.channel.send(f"Left **{channel_name}** 🔇")
     else:
         await message.channel.send("I'm not in a voice channel.")
     
@@ -615,10 +675,10 @@ async def handle_commands(
         return await _handle_uptime(message)
     
     if content_lower.startswith("!join"):
-        return await _handle_join(message)
+        return await _handle_join(message, LongMemory)
     
     if content_lower.startswith("!disconnect") or content_lower.startswith("!leave"):
-        return await _handle_disconnect(message)
+        return await _handle_disconnect(message, LongMemory)
     
     if content_lower.startswith("!trustwhy"):
         return await _handle_trustwhy(message)
@@ -631,9 +691,6 @@ async def handle_commands(
     
     if content_lower.startswith("!tts"):
         return await _handle_tts(message, content)
-    
-    if content_lower.startswith("!voice"):
-        return await _handle_voice(message, content, LongMemory)
     
     if content_lower.startswith("!reminder"):
         return await _handle_reminder(message, content, store, default_tz)
