@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 import discord
@@ -9,10 +10,15 @@ import discord
 if TYPE_CHECKING:
     pass
 
-__all__ = ["build_recent_context", "send_split_message"]
+__all__ = ["build_recent_context", "send_split_message", "RECENT_CONTEXT_LIMIT"]
 
 # Recent context limit for channel history
-RECENT_CONTEXT_LIMIT = 6
+RECENT_CONTEXT_LIMIT = 4  # Reduced from 6 - less context = faster
+
+# Cache recent context per channel to avoid repeated API calls
+# Format: {channel_id: (timestamp, context_list)}
+_CONTEXT_CACHE: dict[int, tuple[float, list[dict]]] = {}
+_CACHE_TTL = 2.0  # Cache valid for 2 seconds
 
 
 async def build_recent_context(
@@ -22,30 +28,53 @@ async def build_recent_context(
     """
     Pull recent channel history as additional context.
     
+    - Uses short-lived cache to avoid repeated API calls
     - Skips bots and commands.
     - Skips messages by the SAME author to avoid duplicating burst parts.
     - Labels each line with speaker name (helps in busy channels).
     
     Returns: list of {role, content} (oldest -> newest).
     """
+    channel_id = message.channel.id
+    now = time.time()
+    
+    # Check cache
+    if channel_id in _CONTEXT_CACHE:
+        cached_time, cached_ctx = _CONTEXT_CACHE[channel_id]
+        if now - cached_time < _CACHE_TTL:
+            # Filter out messages from current author (may differ per call)
+            return [m for m in cached_ctx if not m.get("_author_id") == message.author.id]
+    
     ctx: list[dict] = []
     try:
-        async for m in message.channel.history(limit=limit, before=message):
+        async for m in message.channel.history(limit=limit + 2, before=message):  # Fetch extra for filtering
             if m.author.bot:
                 continue
-            if m.author.id == message.author.id:
-                continue
             content = (m.content or "").strip()
-            if not content:
+            if not content or content.startswith("!"):
                 continue
-            if content.startswith("!"):
-                continue
-            ctx.append({"role": "user", "content": f"{m.author.display_name}: {content}"})
+            ctx.append({
+                "role": "user",
+                "content": f"{m.author.display_name}: {content}",
+                "_author_id": m.author.id,  # For filtering
+            })
+            if len(ctx) >= limit:
+                break
         ctx.reverse()
+        
+        # Cache the full context
+        _CONTEXT_CACHE[channel_id] = (now, ctx)
+        
+        # Evict old cache entries
+        if len(_CONTEXT_CACHE) > 50:
+            oldest_key = min(_CONTEXT_CACHE, key=lambda k: _CONTEXT_CACHE[k][0])
+            del _CONTEXT_CACHE[oldest_key]
+        
     except Exception:
-        # If history fetching fails (permissions), just skip
         return []
-    return ctx
+    
+    # Return filtered (exclude current author)
+    return [{"role": m["role"], "content": m["content"]} for m in ctx if m.get("_author_id") != message.author.id]
 
 
 async def send_split_message(

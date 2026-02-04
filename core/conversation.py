@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING
 
 import discord
@@ -33,6 +34,24 @@ def set_word_filter(word_filter: WordFilter) -> None:
     """Set the word filter instance (called from bot.py)."""
     global _word_filter
     _word_filter = word_filter
+
+
+# =========================
+# Response time tracking
+# =========================
+
+_response_times: list[float] = []
+_RESPONSE_TIME_WINDOW = 5  # Log average every N messages
+
+
+def _track_response_time(response_time: float) -> None:
+    """Track response time and log average every 5 messages."""
+    _response_times.append(response_time)
+    
+    if len(_response_times) >= _RESPONSE_TIME_WINDOW:
+        avg = sum(_response_times) / len(_response_times)
+        log(f"[Stats] Avg response time (last {_RESPONSE_TIME_WINDOW}): {avg:.2f}s")
+        _response_times.clear()
 
 
 # =========================
@@ -139,7 +158,12 @@ async def handle_ai_conversation(
         
         # ask_llama is synchronous; run it in a thread
         async with message.channel.typing():
+            start_time = time.perf_counter()
             reply = await asyncio.to_thread(ask_llama, messages)
+            response_time = time.perf_counter() - start_time
+        
+        # Track response time stats
+        _track_response_time(response_time)
         
         # Filter banned words
         if _word_filter:
@@ -182,7 +206,7 @@ async def handle_ai_conversation(
         if EMOTION_ENABLED:
             emotion.decay()
         
-        log_ai(f"AI > {username}: {reply}")
+        log_ai(f"({response_time:.2f}s) AI > {username}: {reply}")
         await send_split_message(message.channel, reply)
         
         # Optional: auto-voice replies

@@ -28,28 +28,44 @@ EMBED_MODEL = "nomic-embed-text"  # Good balance of quality/speed, 768 dimension
 # Will be auto-detected on first call
 _EMBED_DIM: Optional[int] = None
 
+# LRU cache for query embeddings (avoids re-embedding same queries)
+_EMBED_CACHE: dict[str, List[float]] = {}
+_CACHE_MAX_SIZE = 100  # Keep last 100 unique queries
+
+
+def _cache_key(text: str, model: str) -> str:
+    """Generate cache key for text+model."""
+    return f"{model}:{text[:200].strip().lower()}"
+
 
 # -------------------------
 # Embedding Generation
 # -------------------------
 
-def embed_text(text: str, model: str = EMBED_MODEL) -> Optional[List[float]]:
+def embed_text(text: str, model: str = EMBED_MODEL, use_cache: bool = True) -> Optional[List[float]]:
     """
     Generate embedding vector for text using Ollama.
     
     Returns None if embedding fails (Ollama down, model not available, etc.)
+    Uses LRU cache to avoid re-embedding identical queries.
     """
-    global _EMBED_DIM
+    global _EMBED_DIM, _EMBED_CACHE
     
     text = (text or "").strip()
     if not text:
         return None
     
+    # Check cache first
+    if use_cache:
+        key = _cache_key(text, model)
+        if key in _EMBED_CACHE:
+            return _EMBED_CACHE[key]
+    
     try:
         response = requests.post(
             f"{OLLAMA_URL}/api/embeddings",
             json={"model": model, "prompt": text},
-            timeout=30,
+            timeout=10,  # Reduced from 30s
         )
         response.raise_for_status()
         data = response.json()
@@ -59,6 +75,16 @@ def embed_text(text: str, model: str = EMBED_MODEL) -> Optional[List[float]]:
             # Auto-detect dimension
             if _EMBED_DIM is None:
                 _EMBED_DIM = len(embedding)
+            
+            # Cache the result
+            if use_cache:
+                key = _cache_key(text, model)
+                _EMBED_CACHE[key] = embedding
+                # Evict oldest if cache too large
+                if len(_EMBED_CACHE) > _CACHE_MAX_SIZE:
+                    oldest_key = next(iter(_EMBED_CACHE))
+                    del _EMBED_CACHE[oldest_key]
+            
             return embedding
         return None
         
@@ -127,7 +153,7 @@ def find_similar(
     threshold: float = 0.3,
 ) -> List[Tuple[int, float]]:
     """
-    Find most similar embeddings from candidates.
+    Find most similar embeddings from candidates using vectorized numpy.
     
     Args:
         query_embedding: The query vector
@@ -142,29 +168,62 @@ def find_similar(
         return []
     
     query_vec = embedding_to_numpy(query_embedding)
+    query_norm = np.linalg.norm(query_vec)
+    if query_norm == 0:
+        return []
     
-    scored: List[Tuple[int, float]] = []
+    # Pre-normalize query once
+    query_normalized = query_vec / query_norm
+    
+    # Batch process all candidates for vectorized similarity
+    ids = []
+    embeddings = []
     for item_id, blob in candidates:
-        if not blob:
-            continue
-        
-        try:
-            candidate_vec = blob_to_numpy(blob)
-            sim = cosine_similarity(query_vec, candidate_vec)
-            
-            if sim >= threshold:
-                scored.append((item_id, sim))
-        except Exception:
-            continue
+        if blob:
+            try:
+                embeddings.append(blob_to_numpy(blob))
+                ids.append(item_id)
+            except Exception:
+                continue
     
-    # Sort by similarity descending
+    if not embeddings:
+        return []
+    
+    # Stack into matrix and compute all similarities at once
+    matrix = np.vstack(embeddings)  # Shape: (n_candidates, dim)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1  # Avoid division by zero
+    matrix_normalized = matrix / norms
+    
+    # Vectorized dot product
+    similarities = matrix_normalized @ query_normalized  # Shape: (n_candidates,)
+    
+    # Filter and sort
+    scored = [(ids[i], float(similarities[i])) for i in range(len(ids)) if similarities[i] >= threshold]
     scored.sort(key=lambda x: x[1], reverse=True)
+    
     return scored[:top_k]
 
 
 # -------------------------
 # Utility
 # -------------------------
+
+def clear_embed_cache() -> int:
+    """Clear the embedding cache. Returns number of entries cleared."""
+    global _EMBED_CACHE
+    count = len(_EMBED_CACHE)
+    _EMBED_CACHE.clear()
+    return count
+
+
+def get_cache_stats() -> dict:
+    """Get cache statistics."""
+    return {
+        "size": len(_EMBED_CACHE),
+        "max_size": _CACHE_MAX_SIZE,
+    }
+
 
 def is_ollama_available(model: str = EMBED_MODEL) -> bool:
     """Check if Ollama is running and has the embedding model."""

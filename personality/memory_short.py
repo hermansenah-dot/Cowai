@@ -9,12 +9,16 @@ except ImportError:
 
 MAX_MESSAGES = 8
 
+# Cache the base persona to avoid regenerating it every call
+_PERSONA_CACHE: tuple[str | None, str] | None = None  # (emotion_desc, result)
+
 
 class ShortTermMemory:
     def __init__(self):
         # System message is always index 0
         self.messages = [{"role": "system", "content": ""}]
         self._system_extras: list[str] = []
+        self._last_system_hash: int = 0  # Track if we need to rebuild
         self.refresh_system()
 
     def _ensure_system_message(self) -> None:
@@ -42,23 +46,32 @@ class ShortTermMemory:
 
     def refresh_system(self):
         """Update the system message with persona, emotion and current time."""
-        time_info = (
-            f"Current real-world time: {get_current_time()}.\n"
-            "If the user asks for the time, answer using this value."
-        )
-
-        # Only include emotion description if enabled
+        global _PERSONA_CACHE
+        
+        # Get emotion description
         emotion_desc = emotion.description() if EMOTION_ENABLED else None
-        base = (
-            persona_with_emotion(emotion_desc)
-            + "\n\nIMPORTANT:\n"
-            + "Respond in English only. Do not switch languages."
-            + "\n\n"
-            + time_info
-        )
-
+        
+        # Use cached persona if emotion unchanged
+        if _PERSONA_CACHE and _PERSONA_CACHE[0] == emotion_desc:
+            base_persona = _PERSONA_CACHE[1]
+        else:
+            base_persona = persona_with_emotion(emotion_desc)
+            _PERSONA_CACHE = (emotion_desc, base_persona)
+        
+        # Build time info (changes every call, but simple string)
+        time_info = f"Current real-world time: {get_current_time()}."
+        
+        # Assemble system prompt
+        parts = [
+            base_persona,
+            "\nIMPORTANT:\nRespond in English only. Do not switch languages.",
+            f"\n{time_info}\nIf the user asks for the time, answer using this value.",
+        ]
+        
         if self._system_extras:
-            base += "\n\n" + "\n\n".join(self._system_extras)
+            parts.append("\n\n" + "\n\n".join(self._system_extras))
+        
+        base = "".join(parts)
 
         self._ensure_system_message()
         self.messages[0]["content"] = base

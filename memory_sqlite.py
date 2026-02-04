@@ -383,12 +383,16 @@ class SQLiteMemory:
         if not query:
             return []
 
+        # Fast path: skip vector search for very short queries (greetings, etc.)
+        if len(query) < 10:
+            return self.retrieve_relevant(user_id, query, limit)
+
         mv = _get_vector_module()
         if not mv:
             # Fall back to keyword search
             return self.retrieve_relevant(user_id, query, limit)
 
-        # Embed the query
+        # Embed the query (now cached)
         query_embedding = mv.embed_text(query)
         if not query_embedding:
             # Ollama might be down, fall back
@@ -397,7 +401,7 @@ class SQLiteMemory:
         uid = str(user_id)
         now = now_ts()
 
-        # Fetch all episodes with embeddings for this user
+        # Fetch recent episodes with embeddings (reduced from 500 to 100)
         with self._lock:
             cur = self.conn.cursor()
             cur.execute(
@@ -406,7 +410,7 @@ class SQLiteMemory:
                 FROM episodes
                 WHERE user_id = ? AND embedding IS NOT NULL
                 ORDER BY ts DESC
-                LIMIT 500
+                LIMIT 100
                 """,
                 (uid,),
             )

@@ -78,9 +78,9 @@ def ensure_system_message(
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/chat"
 
 # Must exist in `ollama list` OR be a valid pulled reference
-DEFAULT_MODEL = "llama31-8b-q5"
+DEFAULT_MODEL = "llama3.1:8b"
 
-DEFAULT_NUM_PREDICT = 750
+DEFAULT_NUM_PREDICT = 400
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_TOP_P = 0.9
 DEFAULT_REPEAT_PENALTY = 1.1
@@ -219,7 +219,7 @@ class OllamaChatConfig:
     top_p: float = DEFAULT_TOP_P
     repeat_penalty: float = DEFAULT_REPEAT_PENALTY
     stop_tokens: tuple[str, ...] = field(default_factory=lambda: DEFAULT_STOP_TOKENS)
-    timeout_s: int = 300
+    timeout_s: int = 120
 
     # Persona injection
     inject_persona: bool = True
@@ -261,13 +261,28 @@ class OllamaChatClient:
             },
         }
 
-        try:
-            resp = self._session.post(self.config.url, json=payload, timeout=self.config.timeout_s)
-        except requests.RequestException as e:
-            raise RuntimeError(f"Failed to reach Ollama at {self.config.url}: {e}") from e
+        # Retry logic with exponential backoff for timeouts
+        max_retries = 3
+        base_delay = 2.0
+        last_error: Optional[Exception] = None
 
-        if resp.status_code != 200:
-            raise RuntimeError(f"Ollama error {resp.status_code}: {resp.text}")
+        for attempt in range(max_retries):
+            try:
+                resp = self._session.post(self.config.url, json=payload, timeout=self.config.timeout_s)
+                if resp.status_code != 200:
+                    raise RuntimeError(f"Ollama error {resp.status_code}: {resp.text}")
+                break  # Success, exit retry loop
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # 2s, 4s, 8s
+                    print(f"[ai] Timeout on attempt {attempt + 1}/{max_retries}, retrying in {delay}s...")
+                    import time
+                    time.sleep(delay)
+                else:
+                    raise RuntimeError(f"Ollama timed out after {max_retries} attempts: {e}") from e
+            except requests.RequestException as e:
+                raise RuntimeError(f"Failed to reach Ollama at {self.config.url}: {e}") from e
 
         data = resp.json()
         reply = data.get("message", {}).get("content", "") or ""
