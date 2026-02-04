@@ -12,19 +12,22 @@ A Discord bot that chats via a local Ollama model, supports per-user memory + mo
 - Allowed-channel gate (only replies in `ALLOWED_CHANNEL_IDS`).
 - Chat via Ollama (`ai.py` calls `http://localhost:11434/api/chat`).
 - Burst buffering: rapid consecutive messages from the same user are combined into a single AI request.
-- Long-term memory (facts + episodic "memory cards") stored in SQLite (`memory/memory.db`).
-  - A small JSON snapshot is also written to `memory/users/<user_id>.json` for compatibility/debugging.
-  - Only *relevant* memories are injected into the system prompt per message.
-  - Periodic extraction runs in the background using strict JSON (keeps the bot responsive).
+- **Vector-based semantic memory** using Ollama embeddings (`nomic-embed-text`):
+  - Long-term memory (facts + episodic "memory cards") stored in SQLite with embeddings (`memory/memory.db`).
+  - Relevant memories retrieved via cosine similarity search.
+  - Periodic extraction runs in the background using strict JSON.
+- **Priority message queue** based on per-user trust scores.
 - Simple mood engine that drifts toward neutral (`emotion.py`).
 - Per-user trust scores persisted in SQLite (`memory/trust.db`).
-  - Used to scale how strongly messages affect mood and to provide internal "tone guidance".
+  - Used to scale how strongly messages affect mood and queue priority.
 - Banned-word filtering on AI replies via `WordFilter`; logs filtered words to `logs/filtered_words.txt`.
 - Humanization layer adds natural listening lines and conversation flow (`humanize.py`).
 - Commands (single source of truth in `commands.py`):
   - `!reminder ...` (creates reminders only when explicitly requested)
-  - `!tts ...` (Edge TTS voice synthesis)
-  - `!voice on/off/status` (optional auto-voice replies)
+  - `!join` (bot joins your voice channel and stays connected)
+  - `!disconnect` / `!leave` (bot leaves voice channel)
+  - `!tts ...` (Edge TTS voice synthesis, requires `!join` first)
+  - `!voice on/off/status` (toggle auto-voice replies)
   - `!uptime` (connection uptime / reconnect tracking)
   - `!trust`, `!trustwhy` (view trust)
   - `!trustset`, `!trustadd` (admin only)
@@ -38,7 +41,9 @@ config.py           # Tokens & allowed channels (git-ignored)
 emotion.py          # VAD affect engine
 trust.py            # Per-user trust scores
 humanize.py         # Conversational style layer
-memory_sqlite.py    # SQLite storage for memory
+memory_sqlite.py    # SQLite storage for memory (with vector embeddings)
+memory_vector.py    # Ollama embeddings + cosine similarity search
+message_queue.py    # Priority queue for message processing
 reminders.py        # Reminder system
 triggers.py         # Mood delta analysis
 tts_edge.py         # Edge TTS integration (Microsoft cloud voices)
@@ -49,7 +54,7 @@ utils/              # Shared utilities
 └── burst.py        # BurstBuffer for multi-message handling
 
 personality/        # Persona & memory
-├── persona.py      # Bot character definition
+├── persona.py      # Bot character definition (Evil VTuber persona)
 ├── memory_short.py # Short-term context
 └── memory_long.py  # Long-term memory extraction
 
