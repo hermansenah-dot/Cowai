@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     import discord
 
 # Configuration
-BURST_WINDOW_S: float = 2.5   # Wait this long for more messages
+BURST_WINDOW_S: float = 0.3   # Wait this long for more messages (reduced for faster response)
 BURST_MAX_LINES: int = 6      # Stop buffering after this many messages
 BURST_MAX_CHARS: int = 900    # Stop buffering after this many characters
 

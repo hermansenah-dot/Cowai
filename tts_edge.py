@@ -80,14 +80,17 @@ async def warmup_tts() -> None:
 # =========================
 
 async def handle_tts_command(message: discord.Message, text: str) -> None:
-    """Join voice, synthesize audio, play it, disconnect."""
+    """Synthesize audio and play it in the bot's current voice channel (no auto-disconnect)."""
 
-    if not message.author.voice or not message.author.voice.channel:
-        await message.channel.send("You need to be in a voice channel first.")
+    guild = message.guild
+    if not guild:
         return
 
-    voice_channel = message.author.voice.channel
-    guild = message.guild
+    # Check if bot is already in a voice channel
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        await message.channel.send("I'm not in a voice channel. Use `!join` first.")
+        return
 
     audio_path = TEMP_DIR / f"{uuid.uuid4().hex}.mp3"
 
@@ -100,15 +103,7 @@ async def handle_tts_command(message: discord.Message, text: str) -> None:
         async with _tts_lock:
             await _synthesize_to_file(spoken_text, audio_path)
 
-        # 2) Connect or move bot
-        vc = guild.voice_client
-        if vc and vc.is_connected():
-            if vc.channel.id != voice_channel.id:
-                await vc.move_to(voice_channel)
-        else:
-            vc = await voice_channel.connect()
-
-        # 3) Play via FFmpeg
+        # 2) Play via FFmpeg (bot is already connected)
         ffmpeg_exe = _find_ffmpeg_exe()
         audio = discord.FFmpegPCMAudio(str(audio_path), executable=ffmpeg_exe)
 
@@ -119,16 +114,11 @@ async def handle_tts_command(message: discord.Message, text: str) -> None:
 
         vc.play(audio, after=_after)
         await done.wait()
-        await vc.disconnect()
+        # NOTE: No disconnect - bot stays in channel
 
     except Exception as e:
         print(traceback.format_exc())
         await message.channel.send(f"TTS error: `{e}`")
-        try:
-            if guild and guild.voice_client:
-                await guild.voice_client.disconnect()
-        except Exception:
-            pass
 
     finally:
         try:
@@ -139,31 +129,23 @@ async def handle_tts_command(message: discord.Message, text: str) -> None:
 
 
 async def handle_tts_lines(message: discord.Message, lines: list[str]) -> None:
-    """Join voice once, speak multiple lines back-to-back, then disconnect."""
+    """Speak multiple lines back-to-back in the bot's current voice channel (no auto-disconnect)."""
     lines = [normalize_text(x) for x in (lines or [])]
     lines = [x for x in lines if x]
     if not lines:
         return
 
-    if not message.author.voice or not message.author.voice.channel:
-        await message.channel.send("You need to be in a voice channel first.")
-        return
-
-    voice_channel = message.author.voice.channel
     guild = message.guild
     if guild is None:
         return
 
-    vc = None
-    try:
-        # Connect (or move) once
-        vc = guild.voice_client
-        if vc and vc.is_connected():
-            if vc.channel.id != voice_channel.id:
-                await vc.move_to(voice_channel)
-        else:
-            vc = await voice_channel.connect()
+    # Check if bot is already in a voice channel
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        # For auto-voice replies, silently return if not in channel
+        return
 
+    try:
         ffmpeg_exe = _find_ffmpeg_exe()
 
         for spoken_text in lines:
@@ -191,16 +173,8 @@ async def handle_tts_lines(message: discord.Message, lines: list[str]) -> None:
                 except Exception:
                     pass
 
-        try:
-            await vc.disconnect()
-        except Exception:
-            pass
+        # NOTE: No disconnect - bot stays in channel
 
     except Exception as e:
         print(traceback.format_exc())
         await message.channel.send(f"TTS error: `{e}`")
-        try:
-            if guild.voice_client:
-                await guild.voice_client.disconnect()
-        except Exception:
-            pass

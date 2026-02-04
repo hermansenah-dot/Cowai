@@ -7,8 +7,10 @@ Important design rule (per your requirement):
 - therefore, every command response happens only in allowed channels
 
 Commands in this file:
-- !tts <text>          -> join your VC, speak, leave
-- !voice on/off/status -> auto-speak AI replies (per user, persisted)
+- !join               -> join your voice channel and stay
+- !disconnect         -> leave voice channel
+- !tts <text>         -> speak text in voice channel (must !join first)
+- !voice on/off/status -> toggle auto-speak AI replies (per user, persisted)
 - !reminder <text>     -> reminders ONLY when prefixed with !reminder
 - !trust               -> view trust score
 - !trustwhy            -> view recent trust events
@@ -412,10 +414,21 @@ async def _handle_trust_admin(message: discord.Message, content: str) -> bool:
 
 
 async def _handle_tts(message: discord.Message, content: str) -> bool:
-    """Handle !tts command."""
+    """Handle !tts command - speak text (bot must be in voice channel)."""
     text = content[4:].strip()
     if not text:
-        await message.channel.send("Usage: `!tts your text here`")
+        await message.channel.send("Usage: `!tts <text>`")
+        return True
+    
+    guild = message.guild
+    if not guild:
+        await message.channel.send("This command only works in a server.")
+        return True
+    
+    # Check if bot is in a voice channel
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        await message.channel.send("I'm not in a voice channel. Use `!join` first.")
         return True
     
     tts = _load_tts()
@@ -425,6 +438,55 @@ async def _handle_tts(message: discord.Message, content: str) -> bool:
     
     handle_tts_command, _ = tts
     await handle_tts_command(message, text)
+    return True
+
+
+async def _handle_join(message: discord.Message) -> bool:
+    """Handle !join command - join user's voice channel."""
+    if not message.author.voice or not message.author.voice.channel:
+        await message.channel.send("You need to be in a voice channel first.")
+        return True
+    
+    voice_channel = message.author.voice.channel
+    guild = message.guild
+    
+    if not guild:
+        await message.channel.send("This command only works in a server.")
+        return True
+    
+    try:
+        vc = guild.voice_client
+        if vc and vc.is_connected():
+            if vc.channel.id != voice_channel.id:
+                await vc.move_to(voice_channel)
+                await message.channel.send(f"Moved to **{voice_channel.name}**")
+            else:
+                await message.channel.send(f"Already in **{voice_channel.name}**")
+        else:
+            await voice_channel.connect()
+            await message.channel.send(f"Joined **{voice_channel.name}**")
+    except Exception as e:
+        await message.channel.send(f"Failed to join: `{e}`")
+    
+    return True
+
+
+async def _handle_disconnect(message: discord.Message) -> bool:
+    """Handle !disconnect command - leave voice channel."""
+    guild = message.guild
+    
+    if not guild:
+        await message.channel.send("This command only works in a server.")
+        return True
+    
+    vc = guild.voice_client
+    if vc and vc.is_connected():
+        channel_name = vc.channel.name
+        await vc.disconnect()
+        await message.channel.send(f"Left **{channel_name}**")
+    else:
+        await message.channel.send("I'm not in a voice channel.")
+    
     return True
 
 
@@ -551,6 +613,12 @@ async def handle_commands(
     
     if content_lower.startswith("!uptime"):
         return await _handle_uptime(message)
+    
+    if content_lower.startswith("!join"):
+        return await _handle_join(message)
+    
+    if content_lower.startswith("!disconnect") or content_lower.startswith("!leave"):
+        return await _handle_disconnect(message)
     
     if content_lower.startswith("!trustwhy"):
         return await _handle_trustwhy(message)

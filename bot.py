@@ -44,6 +44,7 @@ from commands import handle_commands, maybe_auto_voice_reply
 from utils.logging import log, log_user, log_ai, DEFAULT_TZ
 from utils.text import WordFilter, load_word_list, split_for_discord
 from utils.burst import enqueue_burst_message, set_burst_handler
+from message_queue import message_queue, Priority
 import humanize
 import uptime
 
@@ -436,8 +437,34 @@ intents.message_content = True
 
 client = discord.Client(intents=intents)
 
-# Register burst handler
-set_burst_handler(handle_ai_conversation)
+
+async def _burst_to_queue_handler(
+    message: "discord.Message",
+    user_text: str,
+    raw_content: str = "",
+) -> None:
+    """
+    Burst buffer calls this after combining rapid messages.
+    We then queue the combined message for priority processing.
+    """
+    # Get trust for priority
+    try:
+        trust_score = trust.get(message.author.id)
+    except Exception:
+        trust_score = 0.5
+    
+    # Queue the message
+    queued = await message_queue.enqueue_with_trust(
+        message, user_text, trust_score, raw_content
+    )
+    
+    if not queued:
+        log(f"[Queue] Dropped message from {message.author.display_name} (queue full)")
+        await message.channel.send("I'm a bit overwhelmed right now, try again in a moment!")
+
+
+# Register burst handler (feeds into queue)
+set_burst_handler(_burst_to_queue_handler)
 
 
 @client.event
@@ -468,6 +495,10 @@ async def on_ready() -> None:
     global _READY_ANNOUNCED, _TTS_READY
     
     log(f"Logged in as {client.user} (ID: {client.user.id})")
+    
+    # Start message queue worker
+    await message_queue.start_worker(handle_ai_conversation)
+    log("[Queue] Message queue worker started.")
     
     # Start background reminder scheduler
     asyncio.create_task(reminder_loop(client, store))
@@ -573,7 +604,7 @@ async def on_message(message: discord.Message) -> None:
     1) Ignore self / empty messages
     2) Enforce allowed channels (return early)
     3) Route commands to commands.py
-    4) Otherwise: normal AI chat
+    4) Otherwise: queue for AI chat
     """
     # Ignore messages from the bot itself
     if message.author == client.user:
@@ -587,7 +618,7 @@ async def on_message(message: discord.Message) -> None:
     if message.channel.id not in ALLOWED_CHANNEL_IDS:
         return
     
-    # Commands
+    # Commands (HIGH priority - bypass queue)
     if content.startswith("!"):
         handled = await handle_commands(
             message,
@@ -599,12 +630,18 @@ async def on_message(message: discord.Message) -> None:
         if handled:
             return
     
-    # AI conversation
+    # AI conversation - queue with trust-based priority
     user_text = content.replace(f"<@{client.user.id}>", "").strip()
     if not user_text:
         return
     
-    # Buffer rapid multi-message bursts
+    # Get trust score for priority
+    try:
+        trust_score = trust.get(message.author.id)
+    except Exception:
+        trust_score = 0.5
+    
+    # Queue message (burst buffer feeds into queue)
     await enqueue_burst_message(message, user_text)
 
 
