@@ -66,6 +66,7 @@ def warmup() -> bool:
 def transcribe(
     audio_path: str | Path,
     language: str = DEFAULT_LANGUAGE,
+    user_id: int = None,
 ) -> str:
     """
     Transcribe an audio file to text.
@@ -99,8 +100,11 @@ def transcribe(
         sentences = re.split(r'(?<=[.!?])\s+', text)
         for sentence in sentences:
             s = sentence.strip()
-            if s:
-                print(s)
+            if s and s != '[BLANK_AUDIO]':
+                if user_id is not None:
+                    print(f"[{user_id}] {s}")
+                else:
+                    print(s)
         
         return text.strip()
         

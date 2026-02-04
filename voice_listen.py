@@ -145,21 +145,28 @@ class STTSink(voice_recv.AudioSink):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._cleanup_task: Optional[asyncio.Task] = None
         self._running = False
+        import concurrent.futures
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     
     def wants_opus(self) -> bool:
         """We want decoded PCM, not opus."""
         return False
     
     def write(self, user: discord.User | discord.Member, data: voice_recv.VoiceData) -> None:
-        """Called for each audio packet received."""
-        if user is None or user.bot:
-            return
-        
-        user_id = user.id
-        if user_id not in self.buffers:
-            self.buffers[user_id] = UserAudioBuffer(user_id)
-        
-        self.buffers[user_id].add_packet(data.pcm)
+        """Called for each audio packet received. Handles OpusError gracefully."""
+        try:
+            if user is None or user.bot:
+                return
+            user_id = user.id
+            if user_id not in self.buffers:
+                self.buffers[user_id] = UserAudioBuffer(user_id)
+            self.buffers[user_id].add_packet(data.pcm)
+        except Exception as e:
+            import discord
+            if isinstance(e, getattr(discord.opus, 'OpusError', Exception)):
+                log(f"[STT] OpusError (corrupted stream) ignored.")
+            else:
+                log(f"[STT] Error in write: {e}")
     
     def cleanup(self) -> None:
         """Called when sink is disconnected."""
@@ -200,55 +207,46 @@ class STTSink(voice_recv.AudioSink):
                 await self._process_user_audio(user_id)
     
     async def _process_user_audio(self, user_id: int) -> None:
-        """Process buffered audio for a user."""
-        async with self._processing_lock:
-            buf = self.buffers.get(user_id)
-            if not buf or not buf.audio_data:
-                return
-            
-            # Get member from guild
-            guild = self.text_channel.guild
-            member = guild.get_member(user_id)
-            if not member:
-                buf.clear()
-                return
-            
-            duration = buf.duration()
-            log(f"[STT] Processing {duration:.1f}s audio from {member.display_name}")
-            
-            # Save to temp file
-            AUDIO_TMP_DIR.mkdir(exist_ok=True)
-            audio_path = AUDIO_TMP_DIR / f"stt_{user_id}_{int(time.time())}.wav"
-            
-            try:
-                wav_data = buf.get_wav_bytes()
-                audio_path.write_bytes(wav_data)
-                
-                # Clear buffer now
-                buf.clear()
-                
-                # Transcribe
-                from stt_whisper import transcribe
-                text = await asyncio.to_thread(transcribe, str(audio_path))
-                
-                if text and text.strip():
-                    log(f"[STT] {member.display_name}: {text}")
-                    # Route to AI handler
-                    await self.on_transcription(member, text.strip())
+        """Process buffered audio for a user in a thread pool."""
+        buf = self.buffers.get(user_id)
+        if not buf or not buf.audio_data:
+            return
+        # Get member from guild
+        guild = self.text_channel.guild
+        member = guild.get_member(user_id)
+        if not member:
+            buf.clear()
+            return
+        duration = buf.duration()
+        log(f"[STT] Processing {duration:.1f}s audio from {member.display_name}")
+        AUDIO_TMP_DIR.mkdir(exist_ok=True)
+        audio_path = AUDIO_TMP_DIR / f"stt_{user_id}_{int(time.time())}.wav"
+        try:
+            wav_data = buf.get_wav_bytes()
+            audio_path.write_bytes(wav_data)
+            buf.clear()
+            from stt_whisper import transcribe
+            loop = asyncio.get_event_loop()
+            # Submit transcription to thread pool
+            text = await loop.run_in_executor(self._executor, transcribe, str(audio_path))
+            if text and text.strip():
+                # Only send to Discord/AI if not [BLANK_AUDIO]
+                if text.strip() == '[BLANK_AUDIO]':
+                    log(f"[STT] {member.display_name} ({member.id}): [BLANK_AUDIO] (not sent to Discord)")
                 else:
-                    log(f"[STT] No speech detected from {member.display_name}")
-                
-            except Exception as e:
-                log(f"[STT] Error processing audio: {e}")
-                buf.clear()
-            
-            finally:
-                # Cleanup temp file
-                try:
-                    if audio_path.exists():
-                        audio_path.unlink()
-                except Exception:
-                    pass
+                    log(f"[STT] {member.display_name} ({member.id}): {text}")
+                    await self.on_transcription(member, text.strip())
+            else:
+                log(f"[STT] No speech detected from {member.display_name}")
+        except Exception as e:
+            log(f"[STT] Error processing audio: {e}")
+            buf.clear()
+        finally:
+            try:
+                if audio_path.exists():
+                    audio_path.unlink()
+            except Exception:
+                pass
 
 
 # -------------------------
