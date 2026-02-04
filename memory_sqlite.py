@@ -223,7 +223,8 @@ class SQLiteMemory:
 
         lines: List[str] = []
         if facts.get("name"):
-            lines.append(f"The user's name is {facts['name']}.")
+            # Be explicit to avoid confusion with bot's name
+            lines.append(f"The person you're talking to is named \"{facts['name']}\" - address them by this name, not yours.")
         if facts.get("preferred_language"):
             lines.append(f"Preferred language: {facts['preferred_language']}.")
 

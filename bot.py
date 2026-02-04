@@ -20,8 +20,20 @@ import discord
 import pytz
 
 # Local imports
-from ai import ask_llama
-from config import DISCORD_TOKEN, ALLOWED_CHANNEL_IDS
+try:
+    from ai import ask_llama, analyze_nlp
+except Exception:
+    from ai import ask_llama
+    analyze_nlp = None  # type: ignore
+
+from config import DISCORD_TOKEN, ALLOWED_CHANNEL_IDS, EMOTION_ENABLED, HUMANIZE_ENABLED
+try:
+    from config import RANDOM_ENGAGE_ENABLED, RANDOM_ENGAGE_MIN_MINUTES, RANDOM_ENGAGE_MAX_MINUTES
+except ImportError:
+    RANDOM_ENGAGE_ENABLED = False
+    RANDOM_ENGAGE_MIN_MINUTES = 5
+    RANDOM_ENGAGE_MAX_MINUTES = 10
+import random
 from emotion import emotion
 from personality.memory_long import Long_Term_Memory
 from personality.memory_short import get_short_memory
@@ -29,7 +41,7 @@ from reminders import ReminderStore, reminder_loop
 from triggers import analyze_input
 from trust import trust
 from commands import handle_commands, maybe_auto_voice_reply
-from utils.logging import log, DEFAULT_TZ
+from utils.logging import log, log_user, log_ai, DEFAULT_TZ
 from utils.text import WordFilter, load_word_list, split_for_discord
 from utils.burst import enqueue_burst_message, set_burst_handler
 import humanize
@@ -44,7 +56,7 @@ if TYPE_CHECKING:
 # =========================
 
 # Recent context limit for channel history
-RECENT_CONTEXT_LIMIT = 12
+RECENT_CONTEXT_LIMIT = 6
 
 # Discord hard-limit is 2000 chars; we keep replies shorter for readability
 DISCORD_MAX = 2000
@@ -72,7 +84,15 @@ store = ReminderStore()
 
 # State flags
 _READY_ANNOUNCED = False
-_COQUI_WARMED_UP = False
+_TTS_READY = False
+
+# =========================
+# Async NLP cache
+# =========================
+
+# We compute NLP in the background and apply it on the *next* turn.
+_NLP_HINT_CACHE: dict[int, str] = {}
+_NLP_INFLIGHT: set[int] = set()
 
 
 # =========================
@@ -151,7 +171,7 @@ async def handle_ai_conversation(
     username = message.author.display_name
     user_id = message.author.id
     
-    log(f"{username}: {user_text}")
+    log_user(f"{username}: {user_text}")
     
     try:
         # --- Per-user memory ---
@@ -168,15 +188,16 @@ async def handle_ai_conversation(
             pass
         
         # --- Emotion processing ---
-        delta = analyze_input(user_text)
-        
-        # Higher trust => mood impacted more strongly by messages
-        if tstyle is not None:
-            try:
-                delta = int(round(float(delta) * float(tstyle.mood_multiplier)))
-            except Exception:
-                pass
-        emotion.apply(delta)
+        if EMOTION_ENABLED:
+            delta = analyze_input(user_text)
+            
+            # Higher trust => mood impacted more strongly by messages
+            if tstyle is not None:
+                try:
+                    delta = int(round(float(delta) * float(tstyle.mood_multiplier)))
+                except Exception:
+                    pass
+            emotion.apply(delta)
         
         # --- Update long-term memory (fast rules) ---
         long_memory.update_from_text(user_text)
@@ -198,12 +219,25 @@ async def handle_ai_conversation(
         style = _build_conversation_style(tstyle)
         
         # Conversation rules (appended to system prompt via memory_short extras)
-        extras.append(humanize.system_style_block(style))
+        if HUMANIZE_ENABLED:
+            extras.append(humanize.system_style_block(style))
         
         # Long-term memory block
         if mem_block:
             extras.append(mem_block)
         
+        
+        # --- NLP hint (async) ---
+        # NLP is computed in the background to keep replies fast.
+        # We apply the last cached hint on the next turn.
+        if analyze_nlp is not None:
+            try:
+                cached = _NLP_HINT_CACHE.get(user_id, "")
+                if cached:
+                    extras.append(cached)
+            except Exception:
+                pass
+
         if extras and hasattr(short_memory, "set_system_extras"):
             try:
                 short_memory.set_system_extras(extras)
@@ -222,7 +256,9 @@ async def handle_ai_conversation(
         # Build chat messages for the LLM
         base_messages = short_memory.get_messages()
         recent_ctx = await build_recent_context(message, limit=RECENT_CONTEXT_LIMIT)
-        messages = [base_messages[0], *recent_ctx, *base_messages[1:]]
+        # Put recent context BEFORE user's conversation history, but after system prompt
+        # This keeps the user's direct conversation coherent at the end
+        messages = [base_messages[0]] + recent_ctx + base_messages[1:]
         
         # ask_llama is synchronous; run it in a thread
         async with message.channel.typing():
@@ -232,10 +268,11 @@ async def handle_ai_conversation(
         reply = _word_filter.filter(reply)
         
         # Add human-like conversational layer
-        try:
-            reply = humanize.apply_human_layer(reply, user_text, style)
-        except Exception:
-            pass
+        if HUMANIZE_ENABLED:
+            try:
+                reply = humanize.apply_human_layer(reply, user_text, style)
+            except Exception:
+                pass
         
         # Store assistant reply in memory
         short_memory.add("assistant", reply)
@@ -250,11 +287,24 @@ async def handle_ai_conversation(
             asyncio.create_task(asyncio.to_thread(long_memory.maybe_extract, ask_llama))
         except Exception:
             pass
+
+        # --- NLP analysis (async, for next turn) ---
+        if analyze_nlp is not None:
+            try:
+                ctx_for_nlp = []
+                try:
+                    ctx_for_nlp = [m for m in getattr(short_memory, "messages", [])[1:] if isinstance(m, dict)][-6:]
+                except Exception:
+                    ctx_for_nlp = []
+                asyncio.create_task(_update_nlp_hint(user_id, user_text, ctx_for_nlp))
+            except Exception:
+                pass
         
         # Emotion decay over time
-        emotion.decay()
+        if EMOTION_ENABLED:
+            emotion.decay()
         
-        log(f"AI > {username}: {reply}")
+        log_ai(f"AI > {username}: {reply}")
         await send_split_message(message.channel, reply)
         
         # Optional: auto-voice replies
@@ -284,11 +334,78 @@ def _ensure_system_message(short_memory) -> None:
         short_memory.messages.insert(0, {"role": "system", "content": ""})
 
 
+async def _update_nlp_hint(user_id: int, user_text: str, ctx_for_nlp: list[dict]) -> None:
+    """Compute NLP in the background and cache a short system hint for next turn."""
+    if analyze_nlp is None:
+        return
+    if user_id in _NLP_INFLIGHT:
+        return
+
+    _NLP_INFLIGHT.add(user_id)
+    try:
+        # Keep it snappy; if the classifier is slow, we just skip this turn.
+        nlp = await asyncio.wait_for(
+            asyncio.to_thread(analyze_nlp, user_text, ctx_for_nlp),
+            timeout=8,
+        )
+        hint = _nlp_system_hint(nlp)
+        if hint:
+            _NLP_HINT_CACHE[user_id] = hint
+        else:
+            _NLP_HINT_CACHE.pop(user_id, None)
+    except Exception:
+        # Never break chat because NLP failed.
+        pass
+    finally:
+        _NLP_INFLIGHT.discard(user_id)
+
+
+
+def _nlp_system_hint(nlp: dict) -> str:
+    """
+    Convert NLP analysis into a short INTERNAL hint for the system prompt.
+    This should be compact and should NOT look like a transcript/telemetry header.
+    """
+    if not isinstance(nlp, dict):
+        return ""
+    intent = str(nlp.get("intent", "")).strip().lower()
+    topic = str(nlp.get("topic", "")).strip()
+    emo = nlp.get("emotion", {}) if isinstance(nlp.get("emotion", {}), dict) else {}
+    label = str(emo.get("label", "")).strip().lower()
+    needs = nlp.get("needs", [])
+    if isinstance(needs, list):
+        needs_s = ", ".join([str(x) for x in needs if str(x).strip()])
+    else:
+        needs_s = ""
+
+    bits = []
+    if intent:
+        bits.append(f"intent={intent}")
+    if topic:
+        bits.append(f"topic={topic}")
+    if label:
+        bits.append(f"emotion={label}")
+    if needs_s:
+        bits.append(f"needs={needs_s}")
+
+    if not bits:
+        return ""
+
+    # Avoid keywords that trigger ai.py telemetry sanitization.
+    # Keep it as a single short block.
+    return "INTERNAL NLP HINT (do not quote): " + "; ".join(bits)
+
+
 def _build_conversation_style(tstyle) -> humanize.Style:
     """Build a Style object from trust and emotion state."""
+    relax = float(getattr(tstyle, "relax", 0.40)) if tstyle is not None else 0.40
+    
+    if not EMOTION_ENABLED:
+        # Return neutral style when emotion is disabled
+        return humanize.Style(relax=relax, mood_label="neutral")
+    
     try:
         m = emotion.metrics()
-        relax = float(getattr(tstyle, "relax", 0.40)) if tstyle is not None else 0.40
         return humanize.Style(
             relax=relax,
             mood_label=emotion.label(),
@@ -297,11 +414,13 @@ def _build_conversation_style(tstyle) -> humanize.Style:
             dominance=float(m.get("dominance", 0.0)),
         )
     except Exception:
-        return humanize.Style(relax=0.40, mood_label=emotion.label())
+        return humanize.Style(relax=relax, mood_label="neutral")
 
 
 def _log_mood_state() -> None:
     """Log current mood state to console."""
+    if not EMOTION_ENABLED:
+        return  # Skip logging when emotion is disabled
     m = emotion.metrics()
     log(
         f"MOOD {emotion.label()} "
@@ -348,17 +467,21 @@ async def on_resumed() -> None:
 @client.event
 async def on_ready() -> None:
     """Fired when the bot connects."""
-    global _READY_ANNOUNCED, _COQUI_WARMED_UP
+    global _READY_ANNOUNCED, _TTS_READY
     
     log(f"Logged in as {client.user} (ID: {client.user.id})")
     
     # Start background reminder scheduler
     asyncio.create_task(reminder_loop(client, store))
     
-    # Optional: warm up coqui-TTS once
-    if not _COQUI_WARMED_UP:
-        _COQUI_WARMED_UP = True
-        asyncio.create_task(_warmup_coqui_tts())
+    # Start random engagement loop if enabled
+    if RANDOM_ENGAGE_ENABLED:
+        asyncio.create_task(_random_engage_loop())
+    
+    # Optional: initialize edge-TTS
+    if not _TTS_READY:
+        _TTS_READY = True
+        asyncio.create_task(_warmup_edge_tts())
     
     # Announce readiness only once per process
     if _READY_ANNOUNCED:
@@ -366,31 +489,81 @@ async def on_ready() -> None:
     _READY_ANNOUNCED = True
 
 
-async def _warmup_coqui_tts() -> None:
-    """Warm up Coqui TTS for faster first voice line."""
-    log("[Voice] coqui-TTS warmup starting...")
+# =========================
+# Random Engagement Loop
+# =========================
+
+# Prompts for random engagement (the AI will riff on these)
+_ENGAGE_PROMPTS = [
+    "Start a casual conversation with chat. Maybe comment on something random, ask what everyone's up to, or share a quick thought.",
+    "Say something playful to get chat's attention. Could be a random observation, a silly question, or just vibing.",
+    "Engage the chat with a fun question or comment. Keep it light and conversational.",
+    "Share a random thought or ask chat something interesting. Be yourself.",
+    "Start some banter with chat. Maybe tease them gently or say something curious.",
+]
+
+
+async def _random_engage_loop() -> None:
+    """Background loop that sends random engagement messages at intervals."""
+    log("[Engage] Random engagement loop started.")
     
-    def _do_warmup():
-        """Synchronous warmup in thread to avoid blocking event loop."""
+    # Wait a bit after startup before first message
+    await asyncio.sleep(60)
+    
+    while True:
         try:
-            from tts_coqui import warmup_tts
-            return warmup_tts
+            # Random wait between configured min and max minutes
+            wait_minutes = random.uniform(RANDOM_ENGAGE_MIN_MINUTES, RANDOM_ENGAGE_MAX_MINUTES)
+            wait_seconds = wait_minutes * 60
+            log(f"[Engage] Next random message in {wait_minutes:.1f} minutes.")
+            await asyncio.sleep(wait_seconds)
+            
+            # Pick a random allowed channel
+            if not ALLOWED_CHANNEL_IDS:
+                continue
+            
+            channel_id = random.choice(list(ALLOWED_CHANNEL_IDS))
+            channel = client.get_channel(channel_id)
+            
+            if channel is None:
+                log(f"[Engage] Could not find channel {channel_id}")
+                continue
+            
+            # Generate an engaging message using the AI
+            prompt = random.choice(_ENGAGE_PROMPTS)
+            messages = [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": "(System: generate a single casual message for chat)"},
+            ]
+            
+            try:
+                reply = await asyncio.to_thread(ask_llama, messages)
+                reply = _word_filter.filter(reply)
+                
+                if reply and len(reply.strip()) > 0:
+                    await channel.send(reply)
+                    log(f"[Engage] Sent random message to #{channel.name}: {reply[:50]}...")
+            except Exception as e:
+                log(f"[Engage] Failed to generate/send message: {e}")
+                
+        except asyncio.CancelledError:
+            log("[Engage] Random engagement loop cancelled.")
+            break
         except Exception as e:
-            raise RuntimeError(f"import failed: {e}") from e
+            log(f"[Engage] Loop error: {e}")
+            await asyncio.sleep(60)  # Wait a bit before retrying
+
+
+async def _warmup_edge_tts() -> None:
+    """Warm up Edge TTS (minimal - Edge TTS is cloud-based)."""
+    log("[Voice] edge-TTS ready.")
     
     try:
-        # Import in a thread to avoid blocking the event loop
-        warmup_tts = await asyncio.to_thread(_do_warmup)
-    except Exception as e:
-        log(f"[Voice] coqui-TTS warmup skipped ({e})")
-        return
-    
-    try:
+        from tts_edge import warmup_tts
         await warmup_tts()
-        log("[Voice] coqui-TTS warmup complete.")
         log("I'm online and ready to chat!")
     except Exception as e:
-        log(f"[Voice] coqui-TTS warmup failed: {e}")
+        log(f"[Voice] edge-TTS import failed: {e}")
 
 
 @client.event

@@ -553,7 +553,8 @@ class Long_Term_Memory:
         # Fallback: facts only (old behavior)
         parts: List[str] = []
         if self.data.get("name"):
-            parts.append(f"The user's name is {self.data['name']}.")
+            # Be very explicit to avoid confusion with the bot's own name
+            parts.append(f"IMPORTANT: The person you are talking to wants to be called \"{self.data['name']}\" (not your name - YOUR name is mAIcé, THEIR name is {self.data['name']}).")
         parts.append(f"Preferred language: {self.data.get('preferred_language', 'English')}.")
         likes = _list_from_any(self.data.get("likes"))
         dislikes = _list_from_any(self.data.get("dislikes"))

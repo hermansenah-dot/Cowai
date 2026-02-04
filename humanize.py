@@ -4,7 +4,14 @@ from __future__ import annotations
 import random
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Callable, Any
+
+import json
+import os
+import sys
+
+# Enable tracing without changing call-sites by setting env var HUMANIZE_TRACE=1
+THOUGHT_TRACE_DEFAULT = os.getenv("HUMANIZE_TRACE", "").strip().lower() in ("1", "true", "yes", "on")
 
 # If you want deterministic behavior while testing, set to True
 DETERMINISTIC = False
@@ -14,6 +21,44 @@ LISTENING_RATE = 0.85
 
 # Max one follow-up question, and only when ambiguity is detected
 FOLLOWUP_RATE = 0.45
+
+# Never show debug-like listening labels in user-facing text
+LISTENING_LABEL_PREFIXES = (
+    "listening line:",
+    "listening:",
+)
+
+def strip_listening_label(s: str) -> str:
+    """Remove any accidental 'Listening line:' style prefix from the start of a line."""
+    if not s:
+        return s
+    lines = s.splitlines()
+    if not lines:
+        return s
+    first = lines[0].lstrip()
+    low = first.lower()
+    for p in LISTENING_LABEL_PREFIXES:
+        if low.startswith(p):
+            # Drop the prefix and following whitespace/punctuation
+            first = re.sub(r"(?i)^listening(\s+line)?\s*:\s*", "", first).lstrip()
+            lines[0] = first
+            break
+    return "\n".join(lines).strip()
+
+
+
+def emit_thought(trace: dict[str, Any], logger: Callable[[str], None] | None = None) -> None:
+    """Emit a compact one-line JSON 'thought pattern' for debugging humanization decisions.
+
+    This deliberately avoids logging raw user text or the full reply. It logs only the
+    internal signals and decisions this module actually uses.
+    """
+    line = json.dumps(trace, ensure_ascii=False, separators=(",", ":"))
+    if logger is not None:
+        logger(line)
+        return
+    # stderr + flush makes it far more likely you actually see it in consoles
+    print(line, file=sys.stderr, flush=True)
 
 
 @dataclass
@@ -119,28 +164,20 @@ def listening_line(user_text: str, style: Style) -> str:
     return opener
 
 
+
 def system_style_block(style: Style) -> str:
     """Short, high-leverage system guidance appended via memory_short extras."""
     if style.relax >= 0.70:
-        emoji = "Allowed occasionally (max 1 per reply)."
-        humor = "Light humor is OK if the user’s tone invites it."
+        tone = "Relaxed, casual. One emoji max per reply if it fits."
     elif style.relax >= 0.35:
-        emoji = "Avoid emojis unless the user uses them first."
-        humor = "Keep it mostly straightforward; tiny playfulness is OK."
+        tone = "Friendly but direct. Skip emojis unless user uses them."
     else:
-        emoji = "No emojis."
-        humor = "Stay professional and neutral."
+        tone = "Professional and neutral. No emojis."
 
-    return (
-        "Conversation style rules:\n"
-        "- Start most replies with a short 'listening' line (1 sentence): acknowledge intent + any constraints, then answer.\n"
-        "- Do NOT repeat the user’s message verbatim.\n"
-        "- Vary response length: one-liners are fine; use bullets only when helpful.\n"
-        "- Ask at most ONE follow-up question, and only if it changes the solution.\n"
-        "- Use natural contractions (don't, you'll, that's) and avoid overly formal phrasing.\n"
-        f"- Emojis: {emoji}\n"
-        f"- Humor: {humor}\n"
-    ).strip()
+    return f"Reply style: {tone} Keep replies short and focused."
+
+
+
 
 
 def looks_like_it_already_listened(reply: str) -> bool:
@@ -175,15 +212,48 @@ def maybe_followup(user_text: str, style: Style) -> str:
     return "Quick check: what part should I change—voice, logging, or commands?"
 
 
-def apply_human_layer(reply: str, user_text: str, style: Style) -> str:
+def apply_human_layer(
+    reply: str,
+    user_text: str,
+    style: Style,
+    thought_trace: bool = THOUGHT_TRACE_DEFAULT,
+    # Back-compat alias: some call-sites may pass trace=True
+    trace: Optional[bool] = None,
+    thought_logger: Callable[[str], None] | None = None,
+) -> str:
+    """Apply the humanization layer.
+
+    If thought_trace=True, prints a compact JSON "thought pattern" describing the
+    internal signals + decisions this module actually used (no raw user/reply text).
+    """
+    if trace is not None:
+        thought_trace = trace
+
     out = (reply or "").strip()
     if not out:
+        if thought_trace:
+            emit_thought(
+                {"module": "humanize", "event": "skip", "reason": "empty_reply"},
+                thought_logger,
+            )
         return out
 
-    parts: list[str] = []
+    # --- signals the layer actually uses ---
+    intent = infer_intent(user_text)
+    constraints = extract_constraints(user_text)
+    ambiguous = is_ambiguous(user_text)
 
-    if should_listen(user_text) and not looks_like_it_already_listened(out):
-        parts.append(listening_line(user_text, style))
+    listen_eligible = should_listen(user_text)
+    reply_already_listening = looks_like_it_already_listened(out)
+
+    # --- apply transforms ---
+    parts: list[str] = []
+    used_listening_line = False
+    added_followup = False
+
+    if listen_eligible and not reply_already_listening:
+        parts.append(strip_listening_label(listening_line(user_text, style)))
+        used_listening_line = True
 
     parts.append(out)
 
@@ -191,5 +261,38 @@ def apply_human_layer(reply: str, user_text: str, style: Style) -> str:
         fu = maybe_followup(user_text, style)
         if fu:
             parts.append(fu)
+            added_followup = True
 
-    return "\n".join(parts).strip()
+    final = "\n".join(parts).strip()
+
+    if thought_trace:
+        style_bucket = "relaxed" if style.relax >= 0.60 else ("neutral" if style.relax >= 0.35 else "strict")
+        energy_bucket = "high" if style.arousal > 0.30 else ("low" if style.arousal < -0.15 else "mid")
+
+        emit_thought(
+            {
+                "module": "humanize",
+                "event": "thought_pattern",
+                "constants": {
+                    "DETERMINISTIC": bool(DETERMINISTIC),
+                    "LISTENING_RATE": LISTENING_RATE,
+                    "FOLLOWUP_RATE": FOLLOWUP_RATE,
+                },
+                "signals": {
+                    "intent": intent,
+                    "constraints_count": len(constraints),
+                    "ambiguous": ambiguous,
+                    "style_bucket": style_bucket,
+                    "energy_bucket": energy_bucket,
+                },
+                "decisions": {
+                    "listen_eligible": listen_eligible,
+                    "reply_already_listening": reply_already_listening,
+                    "used_listening_line": used_listening_line,
+                    "added_followup": added_followup,
+                },
+            },
+            thought_logger,
+        )
+
+    return final

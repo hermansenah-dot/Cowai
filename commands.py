@@ -54,7 +54,7 @@ def _load_tts():
         return None
     
     try:
-        from tts_coqui import handle_tts_command, handle_tts_lines
+        from tts_edge import handle_tts_command, handle_tts_lines
         _TTS_FUNCS = (handle_tts_command, handle_tts_lines)
         return _TTS_FUNCS
     except Exception as e:
@@ -64,7 +64,7 @@ def _load_tts():
 
 def _tts_unavailable_message() -> str:
     """User-facing hint when TTS isn't available."""
-    return "TTS isn't available right now (Coqui failed to import).\n"
+    return "TTS isn't available right now (edge-tts failed to import).\n"
 
 
 # =========================

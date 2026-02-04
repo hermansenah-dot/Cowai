@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import re
+import json
 import requests
 
 # -------------------------
@@ -69,88 +70,13 @@ def ensure_system_message(
 
 
 # -------------------------
-# Telemetry / prompt-leak sanitization
-# -------------------------
-#
-# If your app includes UI/telemetry headers in the prompt (timestamps, "APP", "mAIcé:",
-# valence/arousal, trust score, etc.), many models will echo that format and then
-# "continue the transcript". We defensively strip these lines from BOTH input messages
-# (before sending to Ollama) and from the model output.
-
-_TELEMETRY_LINE_RE = re.compile(
-    r"^\s*(?:\[\d{1,2}:\d{2}\]\s*)?(?:APP\b|mAIc\u00e9:|maic\u00e9:|mAIce:|maice:|"
-    r"valence=|arousal=|dominance=|trust\s+score|response\s+time:|response\s+length:|"
-    r"tone\s+matching\s+mode|style\s+tics:|conversation\s+style\s+rules:|"
-    r"user\s+trust\s+context:|current\s+emotional\s+state:|guidance:|core\s+qualities:|"
-    r"important\s+notes:|known\s+facts:|safety\s+rules:)\b",
-    re.IGNORECASE,
-)
-
-# Markers that indicate the model started printing an internal transcript/telemetry block.
-_TELEMETRY_TRUNCATE_MARKERS: tuple[str, ...] = (
-    "\nAPP\n",
-    "\nAPP\r\n",
-)
-
-
-def _strip_telemetry_lines(text: str) -> str:
-    if not text:
-        return ""
-
-    lines = text.splitlines()
-    kept: List[str] = []
-    for ln in lines:
-        if _TELEMETRY_LINE_RE.search(ln):
-            continue
-        kept.append(ln)
-    # If we stripped everything (rare), fall back to original so we don't blank replies.
-    cleaned = "\n".join(kept).strip()
-    return cleaned if cleaned else text.strip()
-
-
-def _truncate_at_telemetry(text: str) -> str:
-    """Cut off anything after a telemetry/transcript marker if it appears."""
-    if not text:
-        return ""
-    cut = len(text)
-    for m in _TELEMETRY_TRUNCATE_MARKERS:
-        idx = text.find(m)
-        if idx != -1 and idx < cut:
-            cut = idx
-    return text[:cut].strip()
-
-
-def _sanitize_for_llm(text: str) -> str:
-    """Remove telemetry-like lines from text before sending to the model."""
-    return _strip_telemetry_lines(text)
-
-
-def _sanitize_from_llm(text: str) -> str:
-    """Remove telemetry-like blocks from the model output."""
-    return _strip_telemetry_lines(_truncate_at_telemetry(text))
-
-
-def sanitize_messages(messages: Sequence[Mapping[str, str]]) -> List[Dict[str, str]]:
-    """Strip telemetry from message contents to avoid prompt-format lock-in."""
-    sanitized: List[Dict[str, str]] = []
-    for m in messages:
-        role = m.get("role")
-        content = m.get("content")
-        if isinstance(role, str) and isinstance(content, str):
-            sanitized.append({"role": role, "content": _sanitize_for_llm(content)})
-        else:
-            sanitized.append(dict(m))
-    return sanitized
-
-
-# -------------------------
 # Defaults
 # -------------------------
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/chat"
 
 # Must exist in `ollama list` OR be a valid pulled reference
-DEFAULT_MODEL = "hf.co/joshnader/Meta-Llama-3.1-8B-Instruct-Q4_K_M-GGUF:Q4_K_M"
+DEFAULT_MODEL = "llama31-8b-q5"
 
 DEFAULT_NUM_PREDICT = 750
 DEFAULT_TEMPERATURE = 1.0
@@ -177,12 +103,6 @@ DEFAULT_STOP_TOKENS: tuple[str, ...] = (
     # Llama-style header tokens (may appear depending on template)
     "<|start_header_id|>user",
     "<|start_header_id|>assistant",
-    # Telemetry / UI transcript markers (avoid the model continuing these)
-    "\nAPP",
-    "\nmAIc\u00e9:",
-    "\nmaic\u00e9:",
-    "\nmAIce:",
-    "\nmaice:",
 )
 
 # Precompiled cleanup patterns
@@ -211,6 +131,81 @@ def clean_special_tokens(text: str, stop_tokens: Iterable[str] = DEFAULT_STOP_TO
     text = _TRAILING_PIPE_PATTERN.sub("", text)
 
     return text.strip()
+
+
+# -------------------------
+# Telemetry / transcript sanitization
+# -------------------------
+# Some apps accidentally feed internal UI telemetry (timestamps, trust scores, emotion stats)
+# back into the model, and the model then echoes it. These helpers strip such artifacts
+# from both inputs and outputs defensively.
+
+_TELEMETRY_DROP_RE = re.compile(
+    r"""(?ix)
+    ^\[\d{1,2}:\d{2}\]            # [18:12]
+    |^app\s*$                       # APP
+    |^maic[eé]:                      # mAIcé:
+    |\btrust\s*score\b
+    |\bvalence\b
+    |\barousal\b
+    |\bdominance\b
+    |\bresponse\s*time\b
+    |\bstyle\s*tics\b
+    |\bconversation\s*style\s*rules\b
+    """
+)
+
+_TELEMETRY_TRUNC_RE = re.compile(
+    r"""(?ix)
+    (\n\s*app\s*\n)
+    |(\n\s*maic[eé]:)
+    |(\n\s*\[\d{1,2}:\d{2}\])
+    """
+)
+
+
+def _sanitize_from_llm(text: str) -> str:
+    """Strip obvious telemetry/transcript artifacts from model output."""
+    if not text:
+        return ""
+    # Truncate at first strong marker
+    m = _TELEMETRY_TRUNC_RE.search(text)
+    if m:
+        text = text[: m.start()].strip()
+
+    lines = text.splitlines()
+    kept: List[str] = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            kept.append(ln)
+            continue
+        if _TELEMETRY_DROP_RE.search(s):
+            continue
+        kept.append(ln)
+
+    text = "\n".join(kept).strip()
+
+    # Strip repeated inline "|Note: ...|" artifacts (common when prompt blocks include meta notes).
+    # We only remove the Note segment up to the next pipe/newline/end, leaving the rest intact.
+    text = re.sub(r"\s*\|\s*note:.*?(?=\s*\||\n|$)", "", text, flags=re.IGNORECASE)
+
+    # Collapse accidental extra spaces introduced by removals.
+    text = re.sub(r"[ \t]{2,}", " ", text)
+
+    return text.strip()
+
+
+def _sanitize_messages_for_llm(messages: Sequence[Mapping[str, str]]) -> List[Dict[str, str]]:
+    """Remove telemetry lines from message contents before sending to the model."""
+    out: List[Dict[str, str]] = []
+    for m in messages:
+        role = str(m.get("role", ""))
+        content = str(m.get("content", ""))
+        if content:
+            content = _sanitize_from_llm(content)
+        out.append({"role": role, "content": content})
+    return out
 
 
 @dataclass(frozen=True)
@@ -242,15 +237,13 @@ class OllamaChatClient:
 
     def chat(self, messages: Sequence[Mapping[str, str]]) -> str:
         """Send role-based messages to Ollama and return a clean assistant reply."""
-        # Inject persona/system prompt first so it's included in validation + sanitization.
+
         if self.config.inject_persona:
             system_prompt = build_system_prompt(self.config.emotion_description)
             messages = ensure_system_message(messages, system_prompt)
 
-        # Strip any UI/telemetry blocks accidentally included in message content.
-        messages = sanitize_messages(messages)
-
-        # Validate after we may have inserted/sanitized messages.
+        # Defensive cleanup: strip any UI telemetry that may have slipped into history.
+        messages = _sanitize_messages_for_llm(messages)
         self._validate_messages(messages)
 
         payload: Dict[str, Any] = {
@@ -276,9 +269,9 @@ class OllamaChatClient:
 
         data = resp.json()
         reply = data.get("message", {}).get("content", "") or ""
-        # Clean special tokens, then strip any leaked telemetry/transcript blocks.
-        cleaned = clean_special_tokens(reply, stop_tokens=self.config.stop_tokens)
-        return _sanitize_from_llm(cleaned)
+        reply = clean_special_tokens(reply, stop_tokens=self.config.stop_tokens)
+        reply = _sanitize_from_llm(reply)
+        return reply
 
     @staticmethod
     def _validate_messages(messages: Sequence[Mapping[str, str]]) -> None:
@@ -290,6 +283,197 @@ class OllamaChatClient:
                 raise ValueError(f"messages[{i}] must contain 'role' and 'content'")
             if not isinstance(msg["role"], str) or not isinstance(msg["content"], str):
                 raise TypeError(f"messages[{i}]['role'] and ['content'] must be strings")
+
+
+
+# -------------------------
+# NLP analysis (starter module)
+# -------------------------
+#
+# This is intentionally small + strict so you can build on it later.
+# It returns structured signals (intent/emotion/needs/topic) as a dict,
+# and NEVER includes the JSON in chat history by default.
+
+_NLP_SYSTEM_PROMPT = (
+    "You are an NLP classifier for a chat assistant. "
+    "Return EXACTLY one JSON object and nothing else. "
+    "No markdown, no explanations.\n\n"
+    "Schema:\n"
+    "{\n"
+    "  \"intent\": \"question|request|venting|debate|insult|smalltalk|other\",\n"
+    "  \"is_question\": true|false,\n"
+    "  \"topic\": \"short noun phrase or empty\",\n"
+    "  \"emotion\": { \"label\": \"angry|frustrated|sad|anxious|happy|excited|neutral|other\", "
+    "\"valence\": -1.0..1.0, \"arousal\": 0.0..1.0 },\n"
+    "  \"needs\": [\"validation\", \"solution\", \"reassurance\", \"boundary\", \"clarification\"]\n"
+    "}\n\n"
+    "Rules:\n"
+    "- If the message is an insult toward the assistant/user, intent=insult and include needs=['boundary'].\n"
+    "- If the user is venting without a clear question, intent=venting and include needs like validation/reassurance.\n"
+    "- Keep topic short (1-5 words). Use empty string if unclear.\n"
+    "- Clamp numeric ranges.\n"
+)
+
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _extract_first_json_object(text: str) -> Optional[str]:
+    if not text:
+        return None
+    text = text.strip()
+    # Fast path: whole string is JSON
+    if text.startswith("{") and text.endswith("}"):
+        return text
+    m = _JSON_OBJECT_RE.search(text)
+    if m:
+        return m.group(0)
+    return None
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    try:
+        xf = float(x)
+    except Exception:
+        xf = 0.0
+    return max(lo, min(hi, xf))
+
+
+def _normalize_nlp_result(obj: Any) -> Dict[str, Any]:
+    # Safe defaults
+    out: Dict[str, Any] = {
+        "intent": "other",
+        "is_question": False,
+        "topic": "",
+        "emotion": {"label": "neutral", "valence": 0.0, "arousal": 0.3},
+        "needs": [],
+    }
+    if not isinstance(obj, dict):
+        return out
+
+    intent = str(obj.get("intent", out["intent"])).strip().lower()
+    if intent not in {"question", "request", "venting", "debate", "insult", "smalltalk", "other"}:
+        intent = "other"
+    out["intent"] = intent
+
+    out["is_question"] = bool(obj.get("is_question", False))
+
+    topic = str(obj.get("topic", "")).strip()
+    # Avoid huge topics
+    if len(topic) > 80:
+        topic = topic[:80].rstrip()
+    out["topic"] = topic
+
+    emo = obj.get("emotion", {})
+    if isinstance(emo, dict):
+        label = str(emo.get("label", "neutral")).strip().lower()
+        if label not in {"angry", "frustrated", "sad", "anxious", "happy", "excited", "neutral", "other"}:
+            label = "other"
+        out["emotion"] = {
+            "label": label,
+            "valence": _clamp(emo.get("valence", 0.0), -1.0, 1.0),
+            "arousal": _clamp(emo.get("arousal", 0.3), 0.0, 1.0),
+        }
+
+    needs = obj.get("needs", [])
+    if isinstance(needs, list):
+        cleaned = []
+        allowed = {"validation", "solution", "reassurance", "boundary", "clarification"}
+        for n in needs:
+            s = str(n).strip().lower()
+            if s in allowed and s not in cleaned:
+                cleaned.append(s)
+        out["needs"] = cleaned
+
+    # Derive is_question if missing but ends with '?'
+    if "is_question" not in obj and isinstance(obj.get("raw", None), str):
+        out["is_question"] = obj["raw"].rstrip().endswith("?")
+
+    # Strong heuristic: if intent=insult, ensure boundary need
+    if out["intent"] == "insult" and "boundary" not in out["needs"]:
+        out["needs"] = ["boundary"] + out["needs"]
+
+    return out
+
+
+def analyze_nlp(
+    user_text: str,
+    context: Optional[Sequence[Mapping[str, str]]] = None,
+    *,
+    url: str = DEFAULT_OLLAMA_URL,
+    model: str = DEFAULT_MODEL,
+    timeout_s: int = 60,
+) -> Dict[str, Any]:
+    """Return a small NLP analysis dict for the user's latest message.
+
+    This is meant to be called OUTSIDE the main chat history and used as a hint.
+    """
+    user_text = (user_text or "").strip()
+    if not user_text:
+        return _normalize_nlp_result({})
+
+    ctx_lines: List[str] = []
+    if context:
+        # Keep context short and clean
+        for m in list(context)[-6:]:
+            role = str(m.get("role", "")).strip().lower()
+            content = str(m.get("content", "")).strip()
+            if role not in {"user", "assistant"}:
+                continue
+            if not content:
+                continue
+            content = content.replace("\n", " ").strip()
+            if len(content) > 200:
+                content = content[:200].rstrip() + "…"
+            ctx_lines.append(f"{role}: {content}")
+
+    user_block = "User message:\n" + user_text
+    if ctx_lines:
+        user_block += "\n\nRecent context (most recent last):\n" + "\n".join(ctx_lines)
+
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _NLP_SYSTEM_PROMPT},
+            {"role": "user", "content": user_block},
+        ],
+        "stream": False,
+        "options": {
+            "num_predict": 220,
+            "temperature": 0.0,
+            "top_p": 0.2,
+            "repeat_penalty": 1.0,
+            "stop": ["\n\n", "<|eot_id|>", "</s>"],
+        },
+    }
+
+    # Use a short-lived session for analysis to avoid interfering with chat config.
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout_s)
+    except Exception:
+        return _normalize_nlp_result({})
+
+    if resp.status_code != 200:
+        return _normalize_nlp_result({})
+
+    try:
+        data = resp.json()
+        raw = data.get("message", {}).get("content", "") or ""
+    except Exception:
+        raw = ""
+
+    raw = clean_special_tokens(raw, stop_tokens=DEFAULT_STOP_TOKENS)
+    raw = _sanitize_from_llm(raw)
+
+    js = _extract_first_json_object(raw)
+    if not js:
+        return _normalize_nlp_result({})
+
+    try:
+        obj = json.loads(js)
+    except Exception:
+        return _normalize_nlp_result({})
+
+    return _normalize_nlp_result(obj)
 
 
 # Backwards-compatible default client + function name

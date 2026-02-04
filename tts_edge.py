@@ -1,3 +1,9 @@
+"""
+Edge-TTS voice synthesis module.
+
+Replaces Coqui TTS with Microsoft Edge TTS (cloud-based, no GPU needed).
+Provides the same interface: handle_tts_command, handle_tts_lines, warmup_tts.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,8 +14,7 @@ import shutil
 import traceback
 
 import discord
-import torch
-from TTS.api import TTS
+import edge_tts
 
 
 # =========================
@@ -19,10 +24,18 @@ from TTS.api import TTS
 TEMP_DIR = Path("tts_tmp")
 TEMP_DIR.mkdir(exist_ok=True)
 
+# Edge TTS voice - see full list with: edge-tts --list-voices
+# Good options: en-US-JennyNeural, en-US-AriaNeural, en-GB-SoniaNeural
+VOICE = "en-US-JennyNeural"
+
+# Voice tuning
+RATE = "-8%"      # Speed: -50% to +100% (negative = slower)
+VOLUME = "-6%"    # Volume: -50% to +100%
+PITCH = "+40Hz"   # Pitch adjustment
+
 
 def _find_ffmpeg_exe() -> str | None:
     """Return a path to an FFmpeg exe that can find its shared DLLs on Windows."""
-    # Prefer WinGet FFmpeg.Shared (DLLs like avfilter-11.dll live next to ffmpeg.exe)
     localappdata = os.environ.get("LOCALAPPDATA")
     if localappdata:
         pkgs_root = Path(localappdata) / "Microsoft" / "WinGet" / "Packages"
@@ -32,102 +45,34 @@ def _find_ffmpeg_exe() -> str | None:
                     if exe.is_file():
                         return str(exe)
 
-    # Fallback to PATH (may be a WinGet shim; still better than nothing)
     return shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
 
 
-# Multi-speaker English model
-COQUI_MODEL = "tts_models/en/vctk/vits"
-
-# Speaker choice
-SPEAKER_ID = "p248"  # VCTK speaker
-
-# Natural playback tuning:
-# - Keep pitch shifting OFF (pitch hacks destroy formants / naturalness).
-# - If you want slightly faster "streamer" delivery, set PLAYBACK_ATEMPO to ~1.03–1.10.
-PLAYBACK_ATEMPO = 0.90  # 1.0 = normal speed
-
-# GPU toggle
-USE_GPU = False
-
-
-# Lazily-initialized global TTS engine
-_tts_engine: TTS | None = None
-
-# Serialize synthesis calls to avoid torch/model concurrency issues
+# Serialize synthesis calls to avoid concurrency issues
 _tts_lock = asyncio.Lock()
 
 
-def get_tts_engine() -> TTS:
-    """
-    Create/reuse a single TTS engine instance.
-    On CPU, force float32 for stability (avoids Half/dtype edge cases).
-    """
-    global _tts_engine
-    if _tts_engine is None:
-        _tts_engine = TTS(
-            model_name=COQUI_MODEL,
-            progress_bar=False,
-            gpu=USE_GPU,
-        )
-
-        # Force stable CPU behavior (float32)
-        if not USE_GPU:
-            try:
-                _tts_engine.synthesizer.tts_model.cpu().float()
-            except Exception:
-                pass
-            try:
-                _tts_engine.synthesizer.vocoder_model.cpu().float()
-            except Exception:
-                pass
-
-    return _tts_engine
-
-
 def normalize_text(text: str) -> str:
-    """
-    Minimal text normalization for natural speech.
-    (Do NOT force extra punctuation; it often causes robotic prosody.)
-    """
+    """Minimal text normalization for natural speech."""
     return (text or "").strip()
 
 
-def _synthesize_to_file_sync(spoken_text: str, wav_path: Path) -> None:
-    """
-    Synchronous synthesis function (runs in a thread executor).
-    """
-    tts = get_tts_engine()
-    tts.tts_to_file(
-        text=spoken_text,
-        speaker=SPEAKER_ID,
-        file_path=str(wav_path),
+async def _synthesize_to_file(text: str, output_path: Path) -> None:
+    """Generate audio file using Edge TTS."""
+    communicate = edge_tts.Communicate(
+        text,
+        voice=VOICE,
+        rate=RATE,
+        volume=VOLUME,
+        pitch=PITCH,
     )
+    await communicate.save(str(output_path))
 
 
 async def warmup_tts() -> None:
-    """Warm the model at startup so first !tts is fast."""
-    loop = asyncio.get_running_loop()
-
-    async with _tts_lock:
-        await loop.run_in_executor(
-            None,
-            lambda: get_tts_engine().tts("hi", speaker=SPEAKER_ID),
-        )
-
-
-def _ffmpeg_options_for_natural_playback() -> str | None:
-    """
-    Return FFmpeg filter options for natural playback.
-    - No pitch shifting.
-    - Optional small speed change via atempo.
-    """
-    if PLAYBACK_ATEMPO == 1.0:
-        return None
-
-    # atempo supports 0.5–2.0. Keep it subtle for naturalness.
-    at = max(0.5, min(2.0, float(PLAYBACK_ATEMPO)))
-    return f'-filter:a "atempo={at}"'
+    """Warm up Edge TTS (optional - Edge TTS is already fast)."""
+    # Edge TTS doesn't need warmup like local models, but we keep the interface
+    pass
 
 
 # =========================
@@ -135,7 +80,7 @@ def _ffmpeg_options_for_natural_playback() -> str | None:
 # =========================
 
 async def handle_tts_command(message: discord.Message, text: str) -> None:
-    """Join voice, synthesize WAV, play it, disconnect."""
+    """Join voice, synthesize audio, play it, disconnect."""
 
     if not message.author.voice or not message.author.voice.channel:
         await message.channel.send("You need to be in a voice channel first.")
@@ -144,17 +89,16 @@ async def handle_tts_command(message: discord.Message, text: str) -> None:
     voice_channel = message.author.voice.channel
     guild = message.guild
 
-    wav_path = TEMP_DIR / f"{uuid.uuid4().hex}.wav"
+    audio_path = TEMP_DIR / f"{uuid.uuid4().hex}.mp3"
 
     try:
         spoken_text = normalize_text(text)
         if not spoken_text:
             return
 
-        # 1) Generate WAV with Coqui TTS (threaded + locked)
-        loop = asyncio.get_running_loop()
+        # 1) Generate audio with Edge TTS
         async with _tts_lock:
-            await loop.run_in_executor(None, lambda: _synthesize_to_file_sync(spoken_text, wav_path))
+            await _synthesize_to_file(spoken_text, audio_path)
 
         # 2) Connect or move bot
         vc = guild.voice_client
@@ -164,14 +108,9 @@ async def handle_tts_command(message: discord.Message, text: str) -> None:
         else:
             vc = await voice_channel.connect()
 
-        # 3) Play via FFmpeg (natural)
+        # 3) Play via FFmpeg
         ffmpeg_exe = _find_ffmpeg_exe()
-        opts = _ffmpeg_options_for_natural_playback()
-
-        if opts:
-            audio = discord.FFmpegPCMAudio(str(wav_path), executable=ffmpeg_exe, options=opts)
-        else:
-            audio = discord.FFmpegPCMAudio(str(wav_path), executable=ffmpeg_exe)
+        audio = discord.FFmpegPCMAudio(str(audio_path), executable=ffmpeg_exe)
 
         done = asyncio.Event()
 
@@ -193,8 +132,8 @@ async def handle_tts_command(message: discord.Message, text: str) -> None:
 
     finally:
         try:
-            if wav_path.exists():
-                wav_path.unlink()
+            if audio_path.exists():
+                audio_path.unlink()
         except Exception:
             pass
 
@@ -225,22 +164,17 @@ async def handle_tts_lines(message: discord.Message, lines: list[str]) -> None:
         else:
             vc = await voice_channel.connect()
 
-        loop = asyncio.get_running_loop()
         ffmpeg_exe = _find_ffmpeg_exe()
-        opts = _ffmpeg_options_for_natural_playback()
 
         for spoken_text in lines:
-            wav_path = TEMP_DIR / f"{uuid.uuid4().hex}.wav"
+            audio_path = TEMP_DIR / f"{uuid.uuid4().hex}.mp3"
             try:
-                # Synthesize (threaded + locked)
+                # Synthesize
                 async with _tts_lock:
-                    await loop.run_in_executor(None, lambda: _synthesize_to_file_sync(spoken_text, wav_path))
+                    await _synthesize_to_file(spoken_text, audio_path)
 
-                # Play (natural)
-                if opts:
-                    audio = discord.FFmpegPCMAudio(str(wav_path), executable=ffmpeg_exe, options=opts)
-                else:
-                    audio = discord.FFmpegPCMAudio(str(wav_path), executable=ffmpeg_exe)
+                # Play
+                audio = discord.FFmpegPCMAudio(str(audio_path), executable=ffmpeg_exe)
 
                 done = asyncio.Event()
 
@@ -252,8 +186,8 @@ async def handle_tts_lines(message: discord.Message, lines: list[str]) -> None:
 
             finally:
                 try:
-                    if wav_path.exists():
-                        wav_path.unlink()
+                    if audio_path.exists():
+                        audio_path.unlink()
                 except Exception:
                     pass
 

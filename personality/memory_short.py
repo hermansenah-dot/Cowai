@@ -2,7 +2,12 @@ from .persona import persona_with_emotion
 from emotion import emotion
 from tools import get_current_time
 
-MAX_MESSAGES = 12
+try:
+    from config import EMOTION_ENABLED
+except ImportError:
+    EMOTION_ENABLED = True  # Default to enabled if config missing
+
+MAX_MESSAGES = 8
 
 
 class ShortTermMemory:
@@ -42,8 +47,10 @@ class ShortTermMemory:
             "If the user asks for the time, answer using this value."
         )
 
+        # Only include emotion description if enabled
+        emotion_desc = emotion.description() if EMOTION_ENABLED else None
         base = (
-            persona_with_emotion(emotion.description())
+            persona_with_emotion(emotion_desc)
             + "\n\nIMPORTANT:\n"
             + "Respond in English only. Do not switch languages."
             + "\n\n"
