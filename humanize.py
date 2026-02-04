@@ -174,7 +174,7 @@ def system_style_block(style: Style) -> str:
     else:
         tone = "Professional and neutral. No emojis."
 
-    return f"Reply style: {tone} Keep replies short and focused."
+    return f"Reply style: {tone} Let thoughts flow naturally."
 
 
 

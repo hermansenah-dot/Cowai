@@ -25,6 +25,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+# Vector embeddings (lazy import to avoid startup cost if Ollama is down)
+_vector_module = None
+
+def _get_vector_module():
+    """Lazy-load vector module to avoid import errors if numpy missing."""
+    global _vector_module
+    if _vector_module is None:
+        try:
+            import memory_vector as mv
+            _vector_module = mv
+        except ImportError:
+            _vector_module = False  # Mark as unavailable
+    return _vector_module if _vector_module else None
+
 
 def _now_ts() -> int:
     return int(time.time())
@@ -137,6 +151,8 @@ class SQLiteMemory:
             cur.execute("ALTER TABLE episodes ADD COLUMN times_used INTEGER NOT NULL DEFAULT 0")
         if "last_used_ts" not in existing:
             cur.execute("ALTER TABLE episodes ADD COLUMN last_used_ts INTEGER NOT NULL DEFAULT 0")
+        if "embedding" not in existing:
+            cur.execute("ALTER TABLE episodes ADD COLUMN embedding BLOB DEFAULT NULL")
 
         self.conn.commit()
 
@@ -254,6 +270,7 @@ class SQLiteMemory:
         tags: Iterable[str] = (),
         importance: float = 0.5,
         ts: Optional[int] = None,
+        embed: bool = True,
     ) -> None:
         uid = str(user_id)
         text = (text or "").strip()
@@ -264,11 +281,21 @@ class SQLiteMemory:
         importance = float(_clamp(importance, 0.0, 1.0))
         ts = int(ts or _now_ts())
 
+        # Generate embedding if enabled
+        embedding_blob: Optional[bytes] = None
+        if embed:
+            mv = _get_vector_module()
+            if mv:
+                embed_text = f"{text} {tags_str}".strip()
+                embedding = mv.embed_text(embed_text)
+                if embedding:
+                    embedding_blob = mv.embedding_to_blob(embedding)
+
         with self._lock:
             cur = self.conn.cursor()
             cur.execute(
-                "INSERT INTO episodes(user_id, ts, text, tags, importance) VALUES(?, ?, ?, ?, ?)",
-                (uid, ts, text, tags_str, importance),
+                "INSERT INTO episodes(user_id, ts, text, tags, importance, embedding) VALUES(?, ?, ?, ?, ?, ?)",
+                (uid, ts, text, tags_str, importance, embedding_blob),
             )
             self.conn.commit()
 
@@ -323,6 +350,122 @@ class SQLiteMemory:
         picked = [ep for _, ep in scored[: int(limit)]]
 
         # Track usage so frequently recalled episodes become more salient over time.
+        if picked:
+            with self._lock:
+                cur = self.conn.cursor()
+                for ep in picked:
+                    cur.execute(
+                        "UPDATE episodes SET times_used = times_used + 1, last_used_ts = ? WHERE id = ?",
+                        (_now_ts(), int(ep.id)),
+                    )
+                self.conn.commit()
+
+        return picked
+
+    def retrieve_relevant_vector(
+        self,
+        user_id: int,
+        query: str,
+        limit: int = 6,
+        similarity_threshold: float = 0.3,
+        recency_weight: float = 0.3,
+    ) -> List[Episode]:
+        """
+        Retrieve relevant episodes using vector similarity.
+        
+        Falls back to keyword-based retrieve_relevant() if vectors unavailable.
+        
+        Args:
+            user_id: The user to retrieve memories for
+            query: The query text to find similar memories
+            limit: Maximum number of episodes to return
+            similarity_threshold: Minimum cosine similarity (0-1)
+            recency_weight: How much to weight recency vs similarity (0-1)
+        
+        Returns:
+            List of relevant Episode objects
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+
+        mv = _get_vector_module()
+        if not mv:
+            # Fall back to keyword search
+            return self.retrieve_relevant(user_id, query, limit)
+
+        # Embed the query
+        query_embedding = mv.embed_text(query)
+        if not query_embedding:
+            # Ollama might be down, fall back
+            return self.retrieve_relevant(user_id, query, limit)
+
+        uid = str(user_id)
+        now = _now_ts()
+
+        # Fetch all episodes with embeddings for this user
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT id, user_id, ts, text, tags, importance, embedding
+                FROM episodes
+                WHERE user_id = ? AND embedding IS NOT NULL
+                ORDER BY ts DESC
+                LIMIT 500
+                """,
+                (uid,),
+            )
+            rows = cur.fetchall()
+
+        if not rows:
+            # No embedded episodes, fall back
+            return self.retrieve_relevant(user_id, query, limit)
+
+        # Build candidates list
+        candidates = [(int(row["id"]), row["embedding"]) for row in rows if row["embedding"]]
+
+        # Find similar
+        similar = mv.find_similar(
+            query_embedding,
+            candidates,
+            top_k=limit * 2,  # Get extra for hybrid scoring
+            threshold=similarity_threshold,
+        )
+
+        if not similar:
+            return self.retrieve_relevant(user_id, query, limit)
+
+        # Build a map of id -> row for quick lookup
+        row_map = {int(r["id"]): r for r in rows}
+
+        # Hybrid scoring: combine similarity with recency
+        scored: List[Tuple[float, Episode]] = []
+        for ep_id, sim_score in similar:
+            row = row_map.get(ep_id)
+            if not row:
+                continue
+
+            age_days = max(0.0, (now - int(row["ts"])) / 86400.0)
+            recency = _clamp(1.0 - (age_days / 30.0), 0.0, 1.0)
+
+            # Hybrid score: mostly similarity, some recency
+            hybrid = (sim_score * (1 - recency_weight)) + (recency * recency_weight)
+
+            ep = Episode(
+                id=int(row["id"]),
+                user_id=str(row["user_id"]),
+                ts=int(row["ts"]),
+                text=str(row["text"]),
+                tags=str(row["tags"]),
+                importance=float(row["importance"]),
+            )
+            scored.append((hybrid, ep))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        picked = [ep for _, ep in scored[:limit]]
+
+        # Track usage
         if picked:
             with self._lock:
                 cur = self.conn.cursor()
@@ -471,8 +614,26 @@ class SQLiteMemory:
     # Prompt injection
     # -------------------------
 
-    def build_prompt_injection(self, user_id: int, user_query: str, max_episodes: int = 6) -> str:
-        episodes = self.retrieve_relevant(user_id, user_query, limit=max_episodes)
+    def build_prompt_injection(
+        self,
+        user_id: int,
+        user_query: str,
+        max_episodes: int = 6,
+        use_vector: bool = True,
+    ) -> str:
+        """Build memory context for prompt injection.
+        
+        Args:
+            user_id: The user to get memories for
+            user_query: The current query to find relevant memories
+            max_episodes: Maximum episodes to include
+            use_vector: If True, use semantic vector search (falls back to keyword if unavailable)
+        """
+        if use_vector:
+            episodes = self.retrieve_relevant_vector(user_id, user_query, limit=max_episodes)
+        else:
+            episodes = self.retrieve_relevant(user_id, user_query, limit=max_episodes)
+        
         ep_block = self.episodes_as_prompt(episodes)
         facts_block = self.facts_as_prompt(user_id)
 
