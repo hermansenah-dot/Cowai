@@ -18,6 +18,7 @@ import logging
 from pathlib import Path
 
 import discord
+import time
 
 # Suppress noisy voice_recv logs
 logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
@@ -239,7 +240,29 @@ async def on_message(message: discord.Message) -> None:
     user_text = content.replace(f"<@{client.user.id}>", "").strip()
     if not user_text:
         return
-    
+
+
+    # --- Check trust: ignore users with 0.0 trust ---
+    try:
+        current_trust = trust.get_score(message.author.id)
+        if current_trust == 0.0:
+            return  # Ignore user completely
+        if current_trust < 0.7:
+            trust.add(message.author.id, 0.02, reason="active chatter")
+    except Exception as e:
+        log(f"[Trust] Could not update trust for {message.author.id}: {e}")
+
+    # --- Basic spam detection: ignore repeated or rapid messages ---
+    if not hasattr(client, "_last_messages"):
+        client._last_messages = {}
+    now = time.time()
+    user_id = message.author.id
+    last_msg, last_time = client._last_messages.get(user_id, (None, 0))
+    # Ignore if same message as last or sent within 1.5 seconds
+    if user_text == last_msg or (now - last_time) < 1.5:
+        return
+    client._last_messages[user_id] = (user_text, now)
+
     # Queue message (burst buffer feeds into queue)
     await enqueue_burst_message(message, user_text)
 

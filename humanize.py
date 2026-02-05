@@ -124,12 +124,8 @@ def extract_constraints(user_text: str) -> list[str]:
 
 def should_listen(user_text: str) -> bool:
     """Skip listening line for tiny messages to avoid sounding repetitive."""
-    t = (user_text or "").strip()
-    if len(t) < 6:
-        return False
-    if re.fullmatch(r"(ok|okay|thx|thanks|ty|nice|cool)\.?!!?\??", t.lower()):
-        return False
-    return _rng().random() < LISTENING_RATE
+    # Suppress listening lines entirely
+    return False
 
 
 def listening_line(user_text: str, style: Style) -> str:
@@ -264,6 +260,8 @@ def apply_human_layer(
             added_followup = True
 
     final = "\n".join(parts).strip()
+    # Always strip listening line openers before sending to Discord
+    final = strip_listening_label(final)
 
     if thought_trace:
         style_bucket = "relaxed" if style.relax >= 0.60 else ("neutral" if style.relax >= 0.35 else "strict")

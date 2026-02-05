@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 __all__ = ["build_recent_context", "send_split_message", "RECENT_CONTEXT_LIMIT"]
 
 # Recent context limit for channel history
-RECENT_CONTEXT_LIMIT = 4  # Reduced from 6 - less context = faster
+RECENT_CONTEXT_LIMIT = 5  # Changed from 4 - allow 5 messages of context
 
 # Cache recent context per channel to avoid repeated API calls
 # Format: {channel_id: (timestamp, context_list)}
