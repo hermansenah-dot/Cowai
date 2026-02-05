@@ -1,3 +1,4 @@
+
 """commands.py
 
 All Discord command handling is now delegated to split modules.
@@ -32,5 +33,8 @@ async def handle_commands(
         return await handle_tts(message, content)
     if content_lower.startswith("!reminder"):
         return await handle_reminder(message, content, store, default_tz)
-    # ...add more delegations for join, disconnect, voice, etc. as needed...
+    if content_lower.startswith("!join"):
+        from commands.voice import handle_join
+        return await handle_join(message, content)
+    # ...add more delegations for disconnect, voice, etc. as needed...
     return False

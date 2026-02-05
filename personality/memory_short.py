@@ -1,9 +1,9 @@
-from .persona import persona_with_emotion
-from emotion import emotion
+from personality.persona import persona_with_emotion
+from core.mood import emotion
 from utils.helpers import get_current_time
 
 try:
-    from config import EMOTION_ENABLED
+    from config.config import EMOTION_ENABLED
 except ImportError:
     EMOTION_ENABLED = True  # Default to enabled if config missing
 

@@ -1,3 +1,4 @@
+
 """stt_whisper.py
 
 Speech-to-Text using whisper.cpp via pywhispercpp.

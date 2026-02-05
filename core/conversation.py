@@ -1,4 +1,10 @@
-"""AI conversation handler - core message processing logic."""
+"""
+AI conversation handler - core message processing logic.
+Handles:
+- AI reply generation
+- Persona and style integration
+- Context and memory injection (calls core/context.py)
+"""
 
 from __future__ import annotations
 
@@ -9,14 +15,15 @@ from typing import TYPE_CHECKING
 import discord
 
 from ai import ask_llama, analyze_nlp
-from config import EMOTION_ENABLED, HUMANIZE_ENABLED
-from emotion import emotion
+from config.config import EMOTION_ENABLED, HUMANIZE_ENABLED
+from core.mood import emotion
 from personality.memory_long import Long_Term_Memory
 from personality.memory_short import get_short_memory
 from triggers import analyze_input
-from trust import trust
-from commands import maybe_auto_voice_reply
+from core.mood import trust
+from commands.voice import maybe_auto_voice_reply
 from utils.logging import log, log_user, log_ai
+from utils.errors import report_discord_error, wrap_discord_errors
 from utils.text import WordFilter, load_word_list
 from core.context import build_recent_context, send_split_message, RECENT_CONTEXT_LIMIT
 import humanize
@@ -63,6 +70,7 @@ _NLP_HINT_CACHE: dict[int, str] = {}
 _NLP_INFLIGHT: set[int] = set()
 
 
+@wrap_discord_errors
 async def handle_ai_conversation(
     message: discord.Message,
     user_text: str,
@@ -81,114 +89,118 @@ async def handle_ai_conversation(
         
         # --- Trust context (per-user) ---
         tstyle = None
+        # --- Per-user memory ---
+        short_memory = get_short_memory(user_id)
+        long_memory = Long_Term_Memory(user_id)
+
+        # --- Trust context (per-user) ---
+        tstyle = None
         trust_block = None
         try:
             tstyle = trust.style(user_id)
             trust_block = trust.prompt_block(user_id)
-        except Exception:
-            pass
-        
+        except Exception as exc:
+            await report_discord_error(message.channel, "Failed to load trust context.", exc)
+
         # --- Emotion processing ---
         if EMOTION_ENABLED:
             delta = analyze_input(user_text)
-            
             # Higher trust => mood impacted more strongly by messages
             if tstyle is not None:
                 try:
                     delta = int(round(float(delta) * float(tstyle.mood_multiplier)))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    await report_discord_error(message.channel, "Failed to apply mood multiplier.", exc)
             emotion.apply(delta)
-        
+
         # --- Update long-term memory (fast rules) ---
         long_memory.update_from_text(user_text)
-        
+
         # --- Refresh system prompt (persona + emotion + time) ---
         short_memory.refresh_system()
-        
+
         # --- Inject long-term facts as system info ---
         _ensure_system_message(short_memory)
-        
+
         mem_block = (long_memory.as_prompt(user_text) or "").strip()
         extras: list[str] = []
-        
+
         # Trust (per-user)
         if trust_block:
             extras.append(trust_block)
-        
+
         # Build a style hint from trust + emotion
         style = _build_conversation_style(tstyle)
-        
+
         # Conversation rules (appended to system prompt via memory_short extras)
         if HUMANIZE_ENABLED:
             extras.append(humanize.system_style_block(style))
-        
+
         # Long-term memory block
         if mem_block:
             extras.append(mem_block)
-        
+
         # --- NLP hint (async) ---
         if analyze_nlp is not None:
             try:
                 cached = _NLP_HINT_CACHE.get(user_id, "")
                 if cached:
                     extras.append(cached)
-            except Exception:
-                pass
+            except Exception as exc:
+                await report_discord_error(message.channel, "Failed to cache NLP hint.", exc)
 
         if extras and hasattr(short_memory, "set_system_extras"):
             try:
                 short_memory.set_system_extras(extras)
-            except Exception:
-                pass
-        
+            except Exception as exc:
+                await report_discord_error(message.channel, "Failed to set system extras.", exc)
+
         # --- Record message to long-term store ---
         try:
             long_memory.record_message("user", user_text)
-        except Exception:
-            pass
-        
+        except Exception as exc:
+            await report_discord_error(message.channel, "Failed to record user message.", exc)
+
         # --- Add user message to short-term memory ---
         short_memory.add("user", user_text)
-        
+
         # Build chat messages for the LLM
         base_messages = short_memory.get_messages()
         recent_ctx = await build_recent_context(message, limit=RECENT_CONTEXT_LIMIT)
         messages = [base_messages[0]] + recent_ctx + base_messages[1:]
-        
+
         # ask_llama is synchronous; run it in a thread
         async with message.channel.typing():
             start_time = time.perf_counter()
             reply = await asyncio.to_thread(ask_llama, messages)
             response_time = time.perf_counter() - start_time
-        
+
         # Track response time stats
         _track_response_time(response_time)
-        
+
         # Filter banned words
         if _word_filter:
             reply = _word_filter.filter(reply)
-        
+
         # Add human-like conversational layer
         if HUMANIZE_ENABLED:
             try:
                 reply = humanize.apply_human_layer(reply, user_text, style)
-            except Exception:
-                pass
-        
+            except Exception as exc:
+                await report_discord_error(message.channel, "Failed to apply human layer.", exc)
+
         # Store assistant reply in memory
         short_memory.add("assistant", reply)
-        
         try:
             long_memory.record_message("assistant", reply)
-        except Exception:
-            pass
-        
+        except Exception as exc:
+            await report_discord_error(message.channel, "Failed to record assistant message.", exc)
+
         # Periodically extract structured facts/episodes in the background
         try:
             asyncio.create_task(asyncio.to_thread(long_memory.maybe_extract, ask_llama))
-        except Exception:
-            pass
+        except Exception as exc:
+            await report_discord_error(message.channel, "Failed to extract memory.", exc)
 
         # --- NLP analysis (async, for next turn) ---
         if analyze_nlp is not None:
@@ -199,22 +211,20 @@ async def handle_ai_conversation(
                 except Exception:
                     ctx_for_nlp = []
                 asyncio.create_task(_update_nlp_hint(user_id, user_text, ctx_for_nlp))
-            except Exception:
-                pass
-        
+            except Exception as exc:
+                await report_discord_error(message.channel, "Failed to update NLP hint.", exc)
+
         # Emotion decay over time
         if EMOTION_ENABLED:
             emotion.decay()
-        
+
         log_ai(f"({response_time:.2f}s) AI > {username}: {reply}")
         await send_split_message(message.channel, reply)
-        
         # Optional: auto-voice replies
         try:
-            await maybe_auto_voice_reply(message, reply, Long_Term_Memory)
-        except Exception as e:
-            log(f"[Voice] Failed: {e}")
-        
+            await maybe_auto_voice_reply(message, reply)
+        except Exception as exc:
+            await report_discord_error(message.channel, "Voice reply failed.", exc)
         _log_mood_state()
         
     except Exception as e:

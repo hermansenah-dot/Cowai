@@ -27,10 +27,9 @@ from utils.helpers import clamp
 # -------------------------
 
 try:
-    # Local file alongside this module
     from personality.persona import persona_with_emotion
-except Exception:  # pragma: no cover
-    persona_with_emotion = None  # type: ignore[assignment]
+except Exception:
+    persona_with_emotion = None
 
 
 def build_system_prompt(emotion_description: Optional[str] = None) -> str:

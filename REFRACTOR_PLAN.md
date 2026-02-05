@@ -4,6 +4,10 @@
 - Improve maintainability, modularity, and clarity
 - Reduce technical debt and simplify code paths
 - Prepare for future features (streaming STT, advanced memory, persona variants)
+- Ensure all modules, classes, and functions are properly commented and documented for clarity and maintainability
+- Enforce trust-based ignore (users with trust=0.0 are ignored)
+- Add basic spam filter (ignore repeated/rapid messages)
+- Context window is now 5 messages
 
 ## 1. Core Structure Refactor
 - Move all Discord event logic from bot.py into core/handlers.py

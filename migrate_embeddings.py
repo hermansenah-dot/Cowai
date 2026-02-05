@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 # Import our modules
-import memory_vector as mv
+
 
 DB_PATH = Path("memory") / "memory.db"
 BATCH_SIZE = 50  # Embed this many at a time

@@ -25,10 +25,10 @@ logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
 
 # Local imports
 from ai import ask_llama
-from config import DISCORD_TOKEN, ALLOWED_CHANNEL_IDS
+from config.config import DISCORD_TOKEN, ALLOWED_CHANNEL_IDS
 
 try:
-    from config import RANDOM_ENGAGE_ENABLED, RANDOM_ENGAGE_MIN_MINUTES, RANDOM_ENGAGE_MAX_MINUTES
+    from config.config import RANDOM_ENGAGE_ENABLED, RANDOM_ENGAGE_MIN_MINUTES, RANDOM_ENGAGE_MAX_MINUTES
 except ImportError:
     RANDOM_ENGAGE_ENABLED = False
     RANDOM_ENGAGE_MIN_MINUTES = 5
@@ -36,8 +36,8 @@ except ImportError:
 
 from personality.memory_long import Long_Term_Memory
 from reminders import ReminderStore, reminder_loop
-from trust import trust
-from commands import handle_commands
+from core.mood import trust
+from commands_main import handle_commands
 from utils.logging import log, DEFAULT_TZ
 from utils.text import WordFilter, load_word_list
 from utils.burst import enqueue_burst_message, set_burst_handler
@@ -194,77 +194,26 @@ async def _warmup_edge_tts() -> None:
     log("[Voice] edge-TTS ready.")
     
     try:
-        from tts_edge import warmup_tts
+        from voice.tts import warmup_tts
         await warmup_tts()
         log("I'm online and ready to chat!")
     except Exception as e:
         log(f"[Voice] edge-TTS import failed: {e}")
 
 
+from core.handlers import on_message as core_on_message
+
 @client.event
 async def on_message(message: discord.Message) -> None:
-    """
-    Main message handler.
-    
-    Order:
-    1) Ignore self / empty messages
-    2) Enforce allowed channels (return early)
-    3) Route commands to commands.py
-    4) Otherwise: queue for AI chat
-    """
-    # Ignore messages from the bot itself
-    if message.author == client.user:
-        return
-    
-    content = (message.content or "").strip()
-    if not content:
-        return
-    
-    # Channel restriction (hard gate)
-    if message.channel.id not in ALLOWED_CHANNEL_IDS:
-        return
-    
-    # Commands (HIGH priority - bypass queue)
-    if content.startswith("!"):
-        handled = await handle_commands(
-            message,
-            content,
-            store=store,
-            default_tz=DEFAULT_TZ,
-            LongMemory=Long_Term_Memory,
-        )
-        if handled:
-            return
-    
-    # AI conversation - queue with trust-based priority
-    user_text = content.replace(f"<@{client.user.id}>", "").strip()
-    if not user_text:
-        return
-
-
-    # --- Check trust: ignore users with 0.0 trust ---
-    try:
-        current_trust = trust.get_score(message.author.id)
-        if current_trust == 0.0:
-            return  # Ignore user completely
-        if current_trust < 0.7:
-            trust.add(message.author.id, 0.02, reason="active chatter")
-    except Exception as e:
-        log(f"[Trust] Could not update trust for {message.author.id}: {e}")
-
-    # --- Basic spam detection: ignore repeated or rapid messages ---
-    if not hasattr(client, "_last_messages"):
-        client._last_messages = {}
-    now = time.time()
-    user_id = message.author.id
-    last_msg, last_time = client._last_messages.get(user_id, (None, 0))
-    # Ignore if same message as last or sent within 1.5 seconds
-    if user_text == last_msg or (now - last_time) < 1.5:
-        return
-    client._last_messages[user_id] = (user_text, now)
-
-    # Queue message (burst buffer feeds into queue)
-    await enqueue_burst_message(message, user_text)
+    await core_on_message(
+        message,
+        client,
+        store,
+        DEFAULT_TZ,
+        Long_Term_Memory,
+        enqueue_burst_message,
+        ALLOWED_CHANNEL_IDS
+    )
 
 
 # =========================

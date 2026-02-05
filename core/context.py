@@ -1,9 +1,16 @@
-"""Context building utilities for Discord messages."""
+"""
+Context building utilities for Discord messages.
+Provides:
+- build_recent_context: Gathers recent channel history for context window.
+- send_split_message: Sends long messages, split for Discord limits.
+"""
 
 from __future__ import annotations
 
+
 import time
 from typing import TYPE_CHECKING
+from utils.errors import report_discord_error
 
 import discord
 
@@ -61,17 +68,17 @@ async def build_recent_context(
             if len(ctx) >= limit:
                 break
         ctx.reverse()
-        
         # Cache the full context
         _CONTEXT_CACHE[channel_id] = (now, ctx)
-        
         # Evict old cache entries
         if len(_CONTEXT_CACHE) > 50:
             oldest_key = min(_CONTEXT_CACHE, key=lambda k: _CONTEXT_CACHE[k][0])
             del _CONTEXT_CACHE[oldest_key]
-        
-    except Exception:
+    except Exception as exc:
+        await report_discord_error(message.channel, "Failed to build recent context.", exc)
         return []
+    finally:
+        pass
     
     # Return filtered (exclude current author)
     return [{"role": m["role"], "content": m["content"]} for m in ctx if m.get("_author_id") != message.author.id]
@@ -94,4 +101,7 @@ async def send_split_message(
     if len(text) > max_len:
         text = text[:max_len - 3] + "..."
     
-    await channel.send(text)
+    try:
+        await channel.send(text)
+    except Exception as exc:
+        await report_discord_error(channel, "Failed to send message to Discord.", exc)

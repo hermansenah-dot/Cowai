@@ -9,6 +9,7 @@ A Discord bot that chats via a local Ollama model, supports per-user memory + mo
 <br clear="right" />
 
 ### Features
+
 - Allowed-channel gate (only replies in `ALLOWED_CHANNEL_IDS`).
 - Chat via Ollama (`ai.py` calls `http://localhost:11434/api/chat`).
 - Burst buffering: rapid consecutive messages from the same user are combined into a single AI request.
@@ -16,12 +17,15 @@ A Discord bot that chats via a local Ollama model, supports per-user memory + mo
   - Long-term memory (facts + episodic "memory cards") stored in SQLite with embeddings (`memory/memory.db`).
   - Relevant memories retrieved via cosine similarity search.
   - Periodic extraction runs in the background using strict JSON.
-- **Priority message queue** based on per-user trust scores.
+- **Priority message queue** based on per-user trust scores (range: 0.0–1.0; users with 0.0 are ignored).
+  - Trust auto-increases for active chatters (up to 0.7), and users with 0.0 trust are ignored by the bot.
+  - Basic spam protection: repeated or rapid messages are ignored.
 - Simple mood engine that drifts toward neutral (`emotion.py`).
 - Per-user trust scores persisted in SQLite (`memory/trust.db`).
   - Used to scale how strongly messages affect mood and queue priority.
 - Banned-word filtering on AI replies via `WordFilter`; logs filtered words to `logs/filtered_words.txt`.
 - Humanization layer adds natural listening lines and conversation flow (`humanize.py`).
+- Context window: up to 5 recent messages included for AI context.
 - Commands (single source of truth in `commands.py`):
   - `!reminder ...` (creates reminders only when explicitly requested)
   - `!join` (bot joins your voice channel and stays connected)
@@ -105,12 +109,37 @@ python bot.py  # or run.bat
 python -m pytest tests/ -v
 ```
 
-### Notes
-- `logs/`, `memory/`, `tts_tmp/`, and `finetuning/` are ignored by git (runtime data).
-- Trust persistence lives in `memory/trust.db`.
-- Edge TTS requires an internet connection (uses Microsoft's cloud voices).
-- Voice can be changed by editing `VOICE` in `tts_edge.py` (run `edge-tts --list-voices` to see options).
 
-### Memory tips
-- To reset memory for everyone: delete `memory/memory.db` (and optionally `memory/users/`).
-- The memory system attempts basic redaction before storing messages (tokens/keys), but avoid pasting secrets in chat.
+### Error Handling API
+
+All error handling is standardized via `utils/errors.py`:
+
+- Use `CowaiError` for custom exceptions.
+- Use `log_error` to log errors with tracebacks.
+- Use `report_discord_error` to send user-friendly error messages to Discord and log details.
+- Use `wrap_discord_errors` as a decorator for async Discord event handlers to catch/report errors automatically.
+
+**Examples:**
+
+```python
+from utils.errors import CowaiError, log_error, report_discord_error, wrap_discord_errors
+
+# Raise a custom error
+raise CowaiError("Something went wrong.")
+
+# Log an error
+try:
+  ...
+except Exception as exc:
+  log_error("Failed to process event.", exc)
+
+# Report an error to Discord
+await report_discord_error(channel, "Could not complete your request.", exc)
+
+# Decorate a handler
+@wrap_discord_errors
+async def on_message(message):
+  ...
+```
+
+All errors are logged with timestamps and tracebacks. User-facing errors are sent to Discord channels when possible.

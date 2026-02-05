@@ -5,7 +5,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from memory_sqlite import SQLiteMemory
+
+from memory.db import MemoryAPI
 
 
 def _first_meaningful_word(value: str) -> str:
@@ -96,8 +97,9 @@ def _first_meaningful_word(value: str) -> str:
 # project_root/memory/users/<user_id>.json
 BASE_DIR = Path("memory") / "users"
 
-# SQLite DB for structured memory (facts + episodes + message log)
-_SQL = SQLiteMemory(db_path=str(Path("memory") / "memory.db"))
+
+# Unified Memory API instance
+_MEM = MemoryAPI(db_path=str(Path("memory") / "memory.db"))
 
 
 def _bool_from_any(v: Any) -> bool:
@@ -161,7 +163,7 @@ class Long_Term_Memory:
 
     def _load_from_sqlite(self, user_id: int) -> None:
         try:
-            facts = _SQL.get_facts(user_id)
+            facts = _MEM.get_facts(user_id)
         except Exception:
             return
 
@@ -200,32 +202,33 @@ class Long_Term_Memory:
         if not self.data.get("preferred_language"):
             self.data["preferred_language"] = "English"
 
+
     def save(self) -> None:
-        """Persist to SQLite (structured) and write a JSON snapshot."""
+        """Persist to MemoryAPI (structured) and write a JSON snapshot."""
         try:
             uid = int(self.user_id)
         except Exception:
             uid = 0
 
-        # SQLite facts (structured)
+        # MemoryAPI facts (structured)
         try:
             if uid:
                 if self.data.get("name"):
-                    _SQL.upsert_fact(uid, "name", str(self.data["name"]).strip(), confidence=0.9)
+                    _MEM.upsert_fact(uid, "name", str(self.data["name"]).strip(), confidence=0.9)
                 if self.data.get("preferred_language"):
-                    _SQL.upsert_fact(uid, "preferred_language", str(self.data["preferred_language"]).strip(), confidence=0.9)
+                    _MEM.upsert_fact(uid, "preferred_language", str(self.data["preferred_language"]).strip(), confidence=0.9)
 
                 likes = ", ".join(_list_from_any(self.data.get("likes")))
                 dislikes = ", ".join(_list_from_any(self.data.get("dislikes")))
 
                 if likes:
-                    _SQL.upsert_fact(uid, "likes", likes, confidence=0.7)
+                    _MEM.upsert_fact(uid, "likes", likes, confidence=0.7)
                 if dislikes:
-                    _SQL.upsert_fact(uid, "dislikes", dislikes, confidence=0.7)
+                    _MEM.upsert_fact(uid, "dislikes", dislikes, confidence=0.7)
 
-                _SQL.upsert_fact(uid, "voice_enabled", "1" if _bool_from_any(self.data.get("voice_enabled")) else "0", confidence=1.0)
+                _MEM.upsert_fact(uid, "voice_enabled", "1" if _bool_from_any(self.data.get("voice_enabled")) else "0", confidence=1.0)
         except Exception as e:
-            print(f"[Memory] SQLite save failed for {self.user_id}: {e}")
+            print(f"[Memory] MemoryAPI save failed for {self.user_id}: {e}")
 
         # JSON snapshot (debug/compat)
         try:
@@ -249,9 +252,9 @@ class Long_Term_Memory:
     # ------------------
 
     def record_message(self, role: str, content: str) -> None:
-        """Record a message to the SQLite message log for episodic extraction."""
+        """Record a message to the message log for episodic extraction."""
         try:
-            _SQL.add_message(int(self.user_id), role=role, content=content)
+            _MEM.add_message(int(self.user_id), role=role, content=content)
         except Exception:
             pass
 
@@ -262,10 +265,10 @@ class Long_Term_Memory:
         except Exception:
             return
         try:
-            if not _SQL.should_extract(uid, every_n_messages=8):
+            if not _MEM.should_extract(uid, every_n_messages=8):
                 return
-            _SQL.extract_and_store(uid, ask_llama_fn, window=12)
-            _SQL.reset_extract_counter(uid)
+            _MEM.extract_and_store(uid, ask_llama_fn, window=12)
+            _MEM.reset_extract_counter(uid)
         except Exception:
             return
 
@@ -477,14 +480,14 @@ class Long_Term_Memory:
         return bool(tl and _DURABLE_INTENT_RE.search(tl))
 
     def _resolve_referent_from_context(self, prefer_role: str = "assistant", window: int = 10) -> Optional[str]:
-        """Resolve vague 'that/this/it' by looking at recent messages in SQLite."""
+        """Resolve vague 'that/this/it' by looking at recent messages in MemoryAPI."""
         try:
             uid = int(self.user_id)
         except Exception:
             return None
 
         try:
-            msgs = _SQL.get_recent_messages(uid, limit=max(3, int(window)))
+            msgs = _MEM.get_recent_messages(uid, limit=max(3, int(window)))
         except Exception:
             return None
 
@@ -516,7 +519,7 @@ class Long_Term_Memory:
             parts = [p.strip() for p in parts if p.strip()]
             candidate = parts[-1] if parts else content
 
-        candidate = candidate.strip(" \t\n\r""'`“”‘’.,!?:;()").lower()
+        candidate = candidate.strip(" \t\n\r""'`“”‘’.,!?:;()")
         if not candidate or len(candidate) < 3:
             return None
 
@@ -546,7 +549,7 @@ class Long_Term_Memory:
         q = (user_query or "").strip()
         if uid and q:
             try:
-                return _SQL.build_prompt_injection(uid, q, max_episodes=6)
+                return _MEM.build_prompt_injection(uid, q, max_episodes=6)
             except Exception:
                 pass
 
@@ -555,7 +558,7 @@ class Long_Term_Memory:
         if self.data.get("name"):
             # Be very explicit to avoid confusion with the bot's own name
             parts.append(f"IMPORTANT: The person you are talking to wants to be called \"{self.data['name']}\" (not your name - YOUR name is mAIcé, THEIR name is {self.data['name']}).")
-        parts.append(f"Preferred language: {self.data.get('preferred_language', 'English')}.")
+        parts.append(f"Preferred language: {self.data.get('preferred_language', 'English') }.")
         likes = _list_from_any(self.data.get("likes"))
         dislikes = _list_from_any(self.data.get("dislikes"))
         if likes:

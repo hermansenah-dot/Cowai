@@ -58,12 +58,21 @@ memory/
 - Episodes are embedded using Ollama's `nomic-embed-text` model (768 dimensions).
 - Retrieval uses cosine similarity search via `retrieve_relevant_vector()`.
 
-### Priority Queue
+### Priority Queue & Ignore/Spam Filter
 Messages are processed through a priority queue (`message_queue.py`):
 - Trust ≥ 0.7 → HIGH priority
 - Trust ≥ 0.4 → NORMAL priority  
 - Trust < 0.4 → LOW priority
 - System messages → CRITICAL priority
+
+#### Trust Ignore
+- Users with trust = 0.0 are completely ignored by the bot (no response, no processing).
+
+#### Spam Filter
+- Basic spam protection: repeated or rapid messages (within 1.5s or identical to last) are ignored.
+
+#### Context Window
+- Up to 5 recent messages are included for context in each AI reply.
 
 ## Key Conventions
 
