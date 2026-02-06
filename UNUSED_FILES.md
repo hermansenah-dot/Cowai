@@ -28,4 +28,8 @@ This list includes files in the project folder that are not actively used or imp
 - data/
 - finetune_out/
 
+## Added for TL;DR module
+- tldr.py (actively used for webpage summarization)
+- requirements.txt (updated for tldr dependencies)
+
 > Note: Some of these files may be kept for reference, migration, or manual testing. Remove or archive as needed.

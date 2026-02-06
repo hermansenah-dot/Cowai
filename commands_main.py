@@ -1,4 +1,3 @@
-
 """commands.py
 
 All Discord command handling is now delegated to split modules.
@@ -11,6 +10,7 @@ Important design rule:
 from commands.core import handle_uptime, handle_reminder
 from commands.admin import handle_trust_admin
 from commands.voice import handle_tts, get_voice_enabled, set_voice_enabled
+from tldr import extract_url_from_message, handle_tldr_command
 
 async def handle_commands(
     message,  # discord.Message
@@ -33,6 +33,13 @@ async def handle_commands(
         return await handle_tts(message, content)
     if content_lower.startswith("!reminder"):
         return await handle_reminder(message, content, store, default_tz)
+    if content_lower.startswith("!tldr"):
+        url = extract_url_from_message(content)
+        if not url:
+            await message.channel.send("Usage: !tldr <url>")
+            return True
+        await handle_tldr_command(message, url)
+        return True
     if content_lower.startswith("!join"):
         from commands.voice import handle_join
         return await handle_join(message, content)

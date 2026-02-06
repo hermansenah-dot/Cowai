@@ -46,7 +46,7 @@ USE_GPU = False
 EDGE_VOICE = "en-US-JennyNeural"
 EDGE_RATE = "-8%"
 EDGE_VOLUME = "-6%"
-EDGE_PITCH = "+30Hz"
+EDGE_PITCH = "+20Hz"
 
 # --- Locks for concurrency ---
 _coqui_tts_engine: TTS | None = None

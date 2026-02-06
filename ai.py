@@ -89,8 +89,7 @@ DEFAULT_STOP_TOKENS: tuple[str, ...] = (
     "<|eot_id|>",
     "<|endoftext|>",
     "<|ferror_ignore|>",
-    "<|im_end|>",
-    "<|im_end",  # partial
+    "<|im_end|>",  # partial
     "</s>",
     # Common role markers that cause the model to continue as the other side
     "\nUser:",
@@ -103,8 +102,9 @@ DEFAULT_STOP_TOKENS: tuple[str, ...] = (
     "\n### Assistant",
     # Llama-style header tokens (may appear depending on template)
     "<|start_header_id|>user",
-    "<|start_header_id|>assistant",
+    "<|start_header_id|>assistant"
 )
+
 
 # Precompiled cleanup patterns
 _SPECIAL_TOKEN_PATTERN = re.compile(r"<\|[^>]*\|>")
@@ -488,6 +488,11 @@ def analyze_nlp(
 _default_client = OllamaChatClient()
 
 
-def ask_llama(messages: List[Dict[str, str]]) -> str:
-    """Backwards-compatible helper for existing callers."""
+def ask_llama(messages: List[Dict[str, str]], num_predict: int = None) -> str:
+    """Backwards-compatible helper for existing callers, with optional num_predict override."""
+    if num_predict is not None:
+        # Create a new client with custom num_predict
+        config = OllamaChatConfig(num_predict=num_predict)
+        client = OllamaChatClient(config)
+        return client.chat(messages)
     return _default_client.chat(messages)
